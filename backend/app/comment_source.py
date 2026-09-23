@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from .instagram_web import (
-    fetch_comments,
-)
+from .instagram_web import fetch_comments
 
 
 class InstagramFetchError(RuntimeError):
@@ -15,8 +13,6 @@ async def get_comments_for_post(
     post_url: str,
 ) -> list[dict]:
 
-    # Username exists in the campaign record, but the exact
-    # POST LINK is the source of truth.
     _ = username
 
     try:
@@ -36,8 +32,7 @@ async def get_comments_for_post(
 
         raise InstagramFetchError(
             "Instagram opened the post, but no comments "
-            "could be extracted. Check the saved Instagram "
-            "session and whether comments are visible."
+            "could be extracted."
         )
 
     return comments

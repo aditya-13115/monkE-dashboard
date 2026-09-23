@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import (
+    Browser,
     BrowserContext,
     Page,
     TimeoutError as PlaywrightTimeoutError,
@@ -37,6 +38,10 @@ PROFILE_DIR.mkdir(
     exist_ok=True,
 )
 
+STORAGE_STATE_PATH = (
+    PROFILE_DIR / "storage_state.json"
+)
+
 
 POST_RE = re.compile(
     r"(?:instagram\.com)/(?:p|reel|reels)/([^/?#]+)/?",
@@ -48,7 +53,7 @@ def _is_headless() -> bool:
     return (
         os.getenv(
             "INSTAGRAM_HEADLESS",
-            "false",
+            "true",
         )
         .strip()
         .lower()
@@ -113,22 +118,6 @@ def _to_int(value: Any) -> int:
     return int(number)
 
 
-def shortcode_from_url(
-    url: str,
-) -> str:
-
-    match = POST_RE.search(
-        url or ""
-    )
-
-    if not match:
-        raise InstagramWebError(
-            f"Invalid Instagram post/reel URL: {url}"
-        )
-
-    return match.group(1)
-
-
 def _extract_meta(
     page: Page,
     prop: str,
@@ -141,9 +130,12 @@ def _extract_meta(
         )
 
         if locator.count() > 0:
+
             return (
                 locator.first
-                .get_attribute("content")
+                .get_attribute(
+                    "content"
+                )
                 or ""
             ).strip()
 
@@ -184,9 +176,11 @@ def _dismiss_popups(
                 min(count, 3)
             ):
 
-                button = locator.nth(index)
-
                 try:
+
+                    button = locator.nth(
+                        index
+                    )
 
                     if button.is_visible():
 
@@ -239,11 +233,6 @@ def _extract_visible_metrics(
     if not text:
         return result
 
-    # Explicit text such as:
-    #
-    # 1,234 likes
-    # 43 comments
-    #
     likes_match = re.search(
         r"([\d,.]+\s*[kmb]?)\s+likes?\b",
         text,
@@ -279,74 +268,6 @@ def _extract_visible_metrics(
         result["views"] = _to_int(
             views_match.group(1)
         )
-
-    # Current Instagram pages can expose bare counters.
-    #
-    # Example observed:
-    #
-    # 325
-    # 18
-    # April 14
-    #
-    # In that layout we interpret the first number as likes
-    # and second as comments.
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
-
-    date_pattern = re.compile(
-        r"^(?:"
-        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
-        r")[a-z]*\s+\d{1,2}"
-        r"(?:,\s*\d{4})?$",
-        re.IGNORECASE,
-    )
-
-    for index, line in enumerate(lines):
-
-        if not date_pattern.fullmatch(
-            line
-        ):
-            continue
-
-        numbers: list[str] = []
-
-        for candidate in reversed(
-            lines[:index]
-        ):
-
-            if re.fullmatch(
-                r"[\d,.]+\s*[kmb]?",
-                candidate,
-                re.IGNORECASE,
-            ):
-
-                numbers.append(
-                    candidate
-                )
-
-                if len(numbers) == 2:
-                    break
-
-            elif numbers:
-
-                break
-
-        if len(numbers) == 2:
-
-            if result["likes"] == 0:
-                result["likes"] = _to_int(
-                    numbers[1]
-                )
-
-            if result["comments"] == 0:
-                result["comments"] = _to_int(
-                    numbers[0]
-                )
-
-        break
 
     return result
 
@@ -490,7 +411,8 @@ def _extract_body_comments(
                 found_action = True
                 break
 
-            # Next username + timestamp.
+            # Another username followed by a timestamp
+            # means a new comment started.
             if (
                 cursor + 1 < len(lines)
                 and username_pattern.fullmatch(
@@ -523,10 +445,7 @@ def _extract_body_comments(
             comment_parts
         ).strip()
 
-        if (
-            found_action
-            and comment
-        ):
+        if found_action and comment:
 
             key = (
                 f"{username.lower()}:"
@@ -554,22 +473,48 @@ def _extract_body_comments(
     return comments
 
 
-def _open_browser() -> tuple[Any, BrowserContext]:
+def _launch_browser() -> tuple[
+    Any,
+    Browser,
+    BrowserContext,
+]:
+    """
+    IMPORTANT:
+
+    Do NOT use launch_persistent_context() here.
+
+    We load storage_state.json into a normal browser context.
+    That prevents the 'Opening in existing browser session'
+    error when another Chromium instance is open.
+    """
+
+    if not STORAGE_STATE_PATH.exists():
+
+        raise InstagramWebError(
+            "Instagram login state not found:\n"
+            f"{STORAGE_STATE_PATH}\n\n"
+            "Run:\n"
+            "uv run python -m app.instagram_login\n"
+            "and log into Instagram once."
+        )
 
     playwright = (
-        sync_playwright()
-        .start()
+        sync_playwright().start()
     )
 
     try:
 
-        context = (
-            playwright.chromium
-            .launch_persistent_context(
-                user_data_dir=str(
-                    PROFILE_DIR
-                ),
+        browser = (
+            playwright.chromium.launch(
                 headless=_is_headless(),
+            )
+        )
+
+        context = (
+            browser.new_context(
+                storage_state=str(
+                    STORAGE_STATE_PATH
+                ),
                 viewport={
                     "width": 1440,
                     "height": 1000,
@@ -582,6 +527,7 @@ def _open_browser() -> tuple[Any, BrowserContext]:
 
         return (
             playwright,
+            browser,
             context,
         )
 
@@ -596,17 +542,15 @@ def _fetch_comments_sync(
     limit: int = 100,
 ) -> list[dict[str, Any]]:
 
-    playwright, context = (
-        _open_browser()
-    )
+    (
+        playwright,
+        browser,
+        context,
+    ) = _launch_browser()
 
     try:
 
-        page = (
-            context.pages[0]
-            if context.pages
-            else context.new_page()
-        )
+        page = context.new_page()
 
         try:
 
@@ -632,7 +576,6 @@ def _fetch_comments_sync(
             page
         )
 
-        # Allow comments to render.
         page.wait_for_timeout(
             1500
         )
@@ -644,7 +587,6 @@ def _fetch_comments_sync(
             )
         )
 
-        # Scroll a few times to expose more comments.
         for _ in range(10):
 
             if len(comments) >= limit:
@@ -670,10 +612,8 @@ def _fetch_comments_sync(
 
                 existing = {
                     (
-                        row["username"]
-                        .lower(),
-                        row["comment"]
-                        .lower(),
+                        row["username"].lower(),
+                        row["comment"].lower(),
                     )
                     for row in comments
                 }
@@ -681,10 +621,8 @@ def _fetch_comments_sync(
                 for row in more:
 
                     key = (
-                        row["username"]
-                        .lower(),
-                        row["comment"]
-                        .lower(),
+                        row["username"].lower(),
+                        row["comment"].lower(),
                     )
 
                     if key not in existing:
@@ -699,7 +637,7 @@ def _fetch_comments_sync(
                 break
 
         print(
-            f"[Instagram] Extracted "
+            "[Instagram] Extracted "
             f"{len(comments)} comments from "
             f"{post_url}"
         )
@@ -710,25 +648,33 @@ def _fetch_comments_sync(
 
         try:
             context.close()
-        finally:
+        except Exception:
+            pass
+
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+        try:
             playwright.stop()
+        except Exception:
+            pass
 
 
 def _fetch_preview_sync(
     post_url: str,
 ) -> dict[str, Any]:
 
-    playwright, context = (
-        _open_browser()
-    )
+    (
+        playwright,
+        browser,
+        context,
+    ) = _launch_browser()
 
     try:
 
-        page = (
-            context.pages[0]
-            if context.pages
-            else context.new_page()
-        )
+        page = context.new_page()
 
         try:
 
@@ -754,6 +700,12 @@ def _fetch_preview_sync(
             page
         )
 
+        metrics = (
+            _extract_visible_metrics(
+                page
+            )
+        )
+
         thumbnail = _extract_meta(
             page,
             "og:image",
@@ -762,10 +714,6 @@ def _fetch_preview_sync(
         description = _extract_meta(
             page,
             "og:description",
-        )
-
-        metrics = _extract_visible_metrics(
-            page
         )
 
         return {
@@ -786,22 +734,24 @@ def _fetch_preview_sync(
 
         try:
             context.close()
-        finally:
+        except Exception:
+            pass
+
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+        try:
             playwright.stop()
+        except Exception:
+            pass
 
 
 async def fetch_comments(
     post_url: str,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """
-    IMPORTANT:
-
-    The Playwright Sync API NEVER runs in FastAPI's event-loop thread.
-
-    It is executed by asyncio.to_thread(), which gives Playwright its
-    own normal worker thread.
-    """
 
     return await asyncio.to_thread(
         _fetch_comments_sync,
