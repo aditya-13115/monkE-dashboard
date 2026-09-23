@@ -90,3 +90,15 @@ nav button .pill{margin-left:auto}
 
 @media(max-width:1400px){.sentiment-post-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:1100px){.sentiment-post-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.selected-post-banner{grid-template-columns:60px 1fr}.selected-post-actions{grid-column:2;justify-content:flex-start}}
+
+/* Live Instagram + AI result refinements */
+.live-badge{display:inline-flex;align-items:center;gap:5px;color:#07875f;background:#ecfbf5;border:1px solid #c9f3e3;border-radius:999px;padding:3px 6px;font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.03em}
+.live-dot{width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 0 3px rgba(16,185,129,.12)}
+.sentiment-card-status{display:flex;align-items:center;justify-content:space-between;gap:7px;margin-top:9px;color:#8d929d;font-size:8px}
+.live-card-error{display:block;color:#c64b5e;font-size:8px;line-height:1.3;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.result-banner{border-color:#d9cdfb;background:linear-gradient(180deg,#fff,#fcfaff);box-shadow:0 8px 28px rgba(112,69,227,.06)}
+.sentiment-results-anchor{scroll-margin-top:18px}
+
+@media(max-width:1400px){.sentiment-post-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:1100px){.sentiment-post-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.selected-post-banner{grid-template-columns:60px 1fr}.selected-post-actions{grid-column:2;justify-content:flex-start}}
+@media(max-width:800px){.sentiment-post-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}

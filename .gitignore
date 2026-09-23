@@ -1,30 +1,47 @@
-# Python
-backend/.venv/
-__pycache__/
-*.py[cod]
-*.pyo
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Secrets / env
+# Environment / secrets
 .env
 .env.*
 !.env.example
 
-# Node
-frontend/node_modules/
-frontend/dist/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 
-# OS / editors
+# Node
+node_modules/
+dist/
+.vite/
+
+# Playwright / Instagram authenticated sessions
+data/instagram_profile/
+**/instagram_profile/
+storage_state.json
+**/storage_state.json
+
+# Previous Instagram/browser session JSON files
+data/*session*.json
+data/*storage*.json
+data/*auth*.json
+data/*cookie*.json
+data/**/*session*.json
+data/**/*storage*.json
+data/**/*auth*.json
+data/**/*cookie*.json
+
+# Local debug artifacts
+instagram_debug.png
+instagram_debug.html
+**/instagram_debug.png
+**/instagram_debug.html
+
+# Logs
+*.log
+
+# OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-# Runtime
-*.log

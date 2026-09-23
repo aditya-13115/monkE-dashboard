@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity, BarChart3, Bot, ChevronDown, CircleGauge, Download,
   ExternalLink, FileSpreadsheet, Filter, Instagram, LayoutDashboard,
   MessageCircle, Search, Sparkles, Target, TrendingUp, Users,
-  WandSparkles, X
+  WandSparkles, X, CheckCircle2
 } from 'lucide-react'
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart,
@@ -313,17 +313,25 @@ function Categories({ campaign }) {
 }
 
 function thumbnailFor(post) {
-  if (post.thumbnailUrl) return post.thumbnailUrl
-  if (!post.postLink) return ''
-  const match = post.postLink.match(/instagram\.com\/(?:p|reel|reels)\/([^/?#]+)/i)
-  if (!match) return ''
-  const kind = /\/reels?\//i.test(post.postLink) ? 'reel' : 'p'
-  return `https://www.instagram.com/${kind}/${match[1]}/media/?size=l`
+  if (post?.thumbnailUrl) return post.thumbnailUrl
+  if (!post?.postLink) return ''
+  return ''
 }
 
-function PostThumbnail({ post }) {
+function LiveBadge({ source = 'Instagram' }) {
+  return (
+    <span className="live-badge">
+      <span className="live-dot" />
+      {source}
+    </span>
+  )
+}
+
+function PostThumbnail({ post, live }) {
   const [failed, setFailed] = useState(false)
-  const src = thumbnailFor(post)
+  const src = thumbnailFor(live || post)
+
+  useEffect(() => setFailed(false), [src])
 
   return (
     <div className="sentiment-thumb">
@@ -350,7 +358,101 @@ function PostThumbnail({ post }) {
   )
 }
 
-function Sentiment({ campaign, sentiment, setSentiment }) {
+function LivePostCard({ post, live, onLive, onAnalyze, busy, selected }) {
+  const ref = useRef(null)
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(Boolean(live?.liveDataAvailable))
+  const [localError, setLocalError] = useState('')
+
+  useEffect(() => {
+    if (live?.liveDataAvailable) {
+      setLoaded(true)
+      return
+    }
+
+    const node = ref.current
+    if (!node || typeof IntersectionObserver === 'undefined') return
+
+    let cancelled = false
+    const observer = new IntersectionObserver(async entries => {
+      if (!entries.some(entry => entry.isIntersecting)) return
+      observer.disconnect()
+      setLoading(true)
+      setLocalError('')
+      try {
+        const res = await fetch(`${API}/api/posts/${post.id}/live`)
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.detail || 'Live Instagram fetch failed')
+        if (!cancelled) {
+          onLive(post.id, data.post)
+          setLoaded(true)
+        }
+      } catch (error) {
+        if (!cancelled) setLocalError(error.message)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }, { rootMargin: '500px' })
+
+    observer.observe(node)
+
+    return () => {
+      cancelled = true
+      observer.disconnect()
+    }
+  }, [post.id, live?.liveDataAvailable, onLive])
+
+  const merged = live || post
+  const reach = Number(merged.reach || post.reach || 0)
+  const engagement = Number(
+    merged.liveEngagement ?? merged.engagement ?? post.engagement ?? 0
+  )
+  const likes = Number(merged.liveLikes ?? 0)
+  const comments = Number(merged.liveComments ?? 0)
+  const views = Number(merged.liveViews ?? 0)
+  const er = reach > 0 ? (engagement / reach) * 100 : Number(merged.engagementRateReach || 0)
+
+  return (
+    <button
+      ref={ref}
+      className={`sentiment-post-card ${selected ? 'selected' : ''}`}
+      onClick={() => onAnalyze(merged)}
+      disabled={busy && selected}
+    >
+      <PostThumbnail post={post} live={merged} />
+
+      <div className="sentiment-post-body">
+        <div className="sentiment-post-topline">
+          <strong>@{post.username}</strong>
+          <span>{post.category}</span>
+        </div>
+
+        <div className="sentiment-post-metrics">
+          <span><b>{fmt(reach)}</b> reach</span>
+          <span><b>{fmt(engagement)}</b> eng.</span>
+          {likes > 0 && <span><b>{fmt(likes)}</b> likes</span>}
+          {comments > 0 && <span><b>{fmt(comments)}</b> cmts</span>}
+          {views > 0 && <span><b>{fmt(views)}</b> views</span>}
+        </div>
+
+        <div className="sentiment-card-status">
+          {loaded ? <LiveBadge /> : loading ? <span>Syncing Instagram…</span> : <span>Workbook metrics</span>}
+          <span>{pct(er)} ER</span>
+        </div>
+
+        {localError && <small className="live-card-error">Live: {localError}</small>}
+      </div>
+
+      {busy && selected && (
+        <div className="sentiment-card-loading">
+          <div className="loader mini"/> Analyzing comments
+        </div>
+      )}
+    </button>
+  )
+}
+
+function Sentiment({ campaign, sentiment, setSentiment, onLive }) {
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('All')
   const [type, setType] = useState('All')
@@ -361,7 +463,8 @@ function Sentiment({ campaign, sentiment, setSentiment }) {
   const posts = useMemo(() => {
     const q = query.trim().toLowerCase()
     return campaign.records.filter(post => {
-      const okQ = !q || post.username.toLowerCase().includes(q)
+      const username = String(post.username || '').toLowerCase()
+      const okQ = !q || username.includes(q)
       const okC = category === 'All' || post.category === category
       const okT = type === 'All' || post.postType === type
       return okQ && okC && okT
@@ -369,39 +472,75 @@ function Sentiment({ campaign, sentiment, setSentiment }) {
   }, [campaign.records, query, category, type])
 
   async function analyzePost(post) {
-    if (!post) return
+    if (!post || busy) return
+
     setSelectedPost(post)
     setBusy(true)
     setError('')
     setSentiment(null)
 
     try {
+      // Refresh visible post metrics first. This also gives the sentiment page
+      // the best available thumbnail.
+      let latestPost = post
+      try {
+        const liveRes = await fetch(`${API}/api/posts/${post.id}/live`)
+        const liveData = await liveRes.json()
+        if (liveRes.ok && liveData.post) {
+          latestPost = liveData.post
+          onLive(post.id, liveData.post)
+          setSelectedPost(liveData.post)
+        }
+      } catch {
+        // Sentiment still proceeds; Excel values remain available as fallback.
+      }
+
       const res = await fetch(`${API}/api/sentiment/post/${post.id}`, {
         method: 'POST',
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || 'Sentiment analysis failed')
-      setSentiment(data)
+
+      if (!res.ok) {
+        throw new Error(data.detail || 'Sentiment analysis failed')
+      }
+
+      const safe = {
+        ...data,
+        post: data.post || latestPost,
+        analysis: data.analysis || { summary: {}, topics: [], results: [], sample: {} },
+      }
+
+      setSentiment(safe)
+      setSelectedPost({ ...latestPost, ...(data.post || {}) })
+
+      setTimeout(() => {
+        document.getElementById('sentiment-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 80)
     } catch (e) {
-      setError(e.message)
+      setError(e?.message || 'Sentiment analysis failed')
     } finally {
       setBusy(false)
     }
   }
 
   const analysis = sentiment?.analysis
+  const summary = analysis?.summary || {}
+  const topics = Array.isArray(analysis?.topics) ? analysis.topics : []
+  const results = Array.isArray(analysis?.results) ? analysis.results : []
+  const sample = analysis?.sample || {}
   const pie = analysis ? [
-    { name: 'Positive', value: analysis.summary.positive },
-    { name: 'Neutral', value: analysis.summary.neutral },
-    { name: 'Negative', value: analysis.summary.negative },
+    { name: 'Positive', value: Number(summary.positive || 0) },
+    { name: 'Neutral', value: Number(summary.neutral || 0) },
+    { name: 'Negative', value: Number(summary.negative || 0) },
   ] : []
+  const maxTopic = Math.max(1, ...topics.map(item => Number(item.count || 0)))
 
   return (
     <div className="page">
       <SectionHeader
         eyebrow="AI audience voice"
         title="Comment Sentiment"
-        copy="Choose any campaign post. Monk-E fetches that post's comments, samples 50–100 with a higher share of liked comments, and sends them to Groq."
+        copy="Select a campaign post. Monk-E opens the exact Instagram POST LINK from the Excel, pulls the available comments, samples them, and sends them to Groq."
         action={selectedPost && (
           <a className="ghost-btn" href={selectedPost.postLink} target="_blank" rel="noreferrer">
             Open selected post <ExternalLink size={14}/>
@@ -413,11 +552,90 @@ function Sentiment({ campaign, sentiment, setSentiment }) {
         <Bot size={18}/>
         <div>
           <strong>Post-level AI analysis</strong>
-          <span>Click a post below to analyze only that post. The backend uses 70% higher-liked comments + 30% random sampling, then batches 25 comments per Groq request.</span>
+          <span>Live public post metrics are fetched on demand. Comment analysis uses up to 100 comments from Instagram, weighted toward higher-liked comments, then Groq classifies sentiment, topics and emotions.</span>
         </div>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
+
+      {selectedPost && analysis && (
+        <div id="sentiment-results" className="sentiment-results-anchor">
+          <div className="selected-post-banner result-banner">
+            <PostThumbnail post={selectedPost} live={selectedPost}/>
+            <div>
+              <div className="eyebrow">AI analysis ready</div>
+              <h3>@{selectedPost.username}</h3>
+              <p>{selectedPost.category} • {selectedPost.postType} • {fmt(sentiment.commentsAvailable)} comments available</p>
+            </div>
+            <div className="selected-post-actions">
+              <Pill>{sample.selected || results.length} sampled</Pill>
+              <Pill>{sample.likedShare || 0}% liked-comment pool</Pill>
+              <Pill tone="positive"><CheckCircle2 size={11}/> Groq complete</Pill>
+            </div>
+          </div>
+
+          <div className="metric-grid">
+            <Metric icon={MessageCircle} label="Sampled comments" value={fmt(sample.selected || results.length)} sub={`${sample.likedShare || 0}% from liked pool`} accent="violet"/>
+            <Metric icon={TrendingUp} label="Positive" value={`${Number(summary.positivePct || 0).toFixed(1)}%`} sub={`${summary.positive || 0} comments`} accent="mint"/>
+            <Metric icon={CircleGauge} label="Neutral" value={`${Number(summary.neutralPct || 0).toFixed(1)}%`} sub={`${summary.neutral || 0} comments`} accent="blue"/>
+            <Metric icon={Target} label="Negative" value={`${Number(summary.negativePct || 0).toFixed(1)}%`} sub={`${summary.negative || 0} comments`} accent="pink"/>
+            <Metric icon={Bot} label="Model" value="GPT-OSS" sub={analysis.model || 'Groq'} accent="orange"/>
+          </div>
+
+          <div className="grid-two">
+            <div className="panel">
+              <SectionHeader eyebrow="Tone mix" title="Audience sentiment"/>
+              <div className="chart"><ResponsiveContainer width="100%" height={300}>
+                <PieChart>
+                  <Pie data={pie} dataKey="value" nameKey="name" innerRadius={72} outerRadius={104} paddingAngle={3}>
+                    <Cell fill="#10b981"/><Cell fill="#94a3b8"/><Cell fill="#f43f5e"/>
+                  </Pie>
+                  <Tooltip/>
+                </PieChart>
+              </ResponsiveContainer></div>
+              <div className="sentiment-legend">
+                <span><i className="mint"/>{Number(summary.positivePct || 0).toFixed(1)}% positive</span>
+                <span><i className="slate"/>{Number(summary.neutralPct || 0).toFixed(1)}% neutral</span>
+                <span><i className="rose"/>{Number(summary.negativePct || 0).toFixed(1)}% negative</span>
+              </div>
+            </div>
+
+            <div className="panel">
+              <SectionHeader eyebrow="Conversation themes" title="What people are talking about"/>
+              {topics.length ? (
+                <div className="topic-list">
+                  {topics.map(t => (
+                    <div className="topic-row" key={t.topic}>
+                      <span>{t.topic}</span>
+                      <div className="topic-track"><b style={{width:`${Math.min(100, Number(t.count || 0) / maxTopic * 100)}%`}}/></div>
+                      <strong>{t.count}</strong>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="muted">No topic results were returned.</div>
+              )}
+            </div>
+          </div>
+
+          <div className="panel">
+            <SectionHeader eyebrow="Comment review" title="Sampled comments" copy={`Showing the first 20 of ${results.length} analyzed comments.`}/>
+            <div className="comments">
+              {results.slice(0,20).map((r, index) => (
+                <div className="comment-row" key={`${r.id || index}-${r.username || ''}`}>
+                  <div className="avatar">{initials(r.username || 'IG')}</div>
+                  <div className="comment-main">
+                    <div><strong>{r.username ? `@${r.username}` : 'Instagram user'}</strong><span>♥ {fmt(r.likes || 0)}</span></div>
+                    <p>{r.comment}</p>
+                    <small>{r.topic || 'other'} • {r.emotion || 'neutral'} • {Math.round(Number(r.confidence || 0) * 100)}% confidence</small>
+                  </div>
+                  <Pill tone={r.sentiment}>{r.sentiment}</Pill>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="toolbar">
         <div className="searchbox">
@@ -443,26 +661,15 @@ function Sentiment({ campaign, sentiment, setSentiment }) {
 
       <div className="sentiment-post-grid">
         {posts.map(post => (
-          <button
+          <LivePostCard
             key={post.id}
-            className={`sentiment-post-card ${selectedPost?.id === post.id ? 'selected' : ''}`}
-            onClick={() => analyzePost(post)}
-            disabled={busy && selectedPost?.id === post.id}
-          >
-            <PostThumbnail post={post}/>
-            <div className="sentiment-post-body">
-              <div className="sentiment-post-topline">
-                <strong>@{post.username}</strong>
-                <span>{post.category}</span>
-              </div>
-              <div className="sentiment-post-metrics">
-                <span><b>{fmt(post.reach)}</b> reach</span>
-                <span><b>{fmt(post.engagement)}</b> eng.</span>
-                <span><b>{pct(post.engagementRateReach)}</b> ER</span>
-              </div>
-            </div>
-            {busy && selectedPost?.id === post.id && <div className="sentiment-card-loading"><div className="loader mini"/> Analyzing</div>}
-          </button>
+            post={post}
+            live={post.liveDataAvailable ? post : null}
+            onLive={onLive}
+            onAnalyze={analyzePost}
+            busy={busy}
+            selected={selectedPost?.id === post.id}
+          />
         ))}
       </div>
 
@@ -470,77 +677,8 @@ function Sentiment({ campaign, sentiment, setSentiment }) {
         <div className="empty-panel sentiment-empty">
           <div className="empty-icon"><MessageCircle size={28}/></div>
           <h3>Select a post to analyze</h3>
-          <p>Every card above is linked to the post URL in the campaign Excel. Clicking a card starts the post-specific comment sentiment workflow.</p>
+          <p>Each card uses the exact POST LINK from the campaign workbook. Thumbnails and public Instagram metrics are loaded lazily as cards enter the viewport.</p>
         </div>
-      )}
-
-      {selectedPost && analysis && (
-        <>
-          <div className="selected-post-banner">
-            <PostThumbnail post={selectedPost}/>
-            <div>
-              <div className="eyebrow">Analyzed placement</div>
-              <h3>@{selectedPost.username}</h3>
-              <p>{selectedPost.category} • {selectedPost.postType} • {fmt(sentiment.commentsAvailable)} comments available</p>
-            </div>
-            <div className="selected-post-actions">
-              <Pill>{analysis.sample.selected} sampled</Pill>
-              <Pill>{analysis.sample.likedShare}% from liked-comment pool</Pill>
-            </div>
-          </div>
-
-          <div className="metric-grid">
-            <Metric icon={MessageCircle} label="Sampled comments" value={fmt(analysis.sample.selected)} sub={`${analysis.sample.likedShare}% had likes`} accent="violet"/>
-            <Metric icon={TrendingUp} label="Positive" value={`${analysis.summary.positivePct}%`} sub={`${analysis.summary.positive} comments`} accent="mint"/>
-            <Metric icon={CircleGauge} label="Neutral" value={`${analysis.summary.neutralPct}%`} sub={`${analysis.summary.neutral} comments`} accent="blue"/>
-            <Metric icon={Target} label="Negative" value={`${analysis.summary.negativePct}%`} sub={`${analysis.summary.negative} comments`} accent="pink"/>
-            <Metric icon={Bot} label="Model" value="GPT-OSS" sub={analysis.model || 'Groq'} accent="orange"/>
-          </div>
-
-          <div className="grid-two">
-            <div className="panel">
-              <SectionHeader eyebrow="Tone mix" title="Audience sentiment"/>
-              <div className="chart"><ResponsiveContainer width="100%" height={300}>
-                <PieChart>
-                  <Pie data={pie} dataKey="value" nameKey="name" innerRadius={72} outerRadius={104} paddingAngle={3}>
-                    <Cell fill="#10b981"/><Cell fill="#94a3b8"/><Cell fill="#f43f5e"/>
-                  </Pie>
-                  <Tooltip/>
-                </PieChart>
-              </ResponsiveContainer></div>
-              <div className="sentiment-legend"><span><i className="mint"/>{analysis.summary.positivePct}% positive</span><span><i className="slate"/>{analysis.summary.neutralPct}% neutral</span><span><i className="rose"/>{analysis.summary.negativePct}% negative</span></div>
-            </div>
-            <div className="panel">
-              <SectionHeader eyebrow="Conversation themes" title="What people are talking about"/>
-              <div className="topic-list">
-                {analysis.topics.map(t => (
-                  <div className="topic-row" key={t.topic}>
-                    <span>{t.topic}</span>
-                    <div className="topic-track"><b style={{width:`${Math.min(100,t.count/Math.max(...analysis.topics.map(x=>x.count))*100)}%`}}/></div>
-                    <strong>{t.count}</strong>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="panel">
-            <SectionHeader eyebrow="Comment review" title="Sampled comments" copy={`Showing the first 20 of ${analysis.results.length} analyzed comments.`}/>
-            <div className="comments">
-              {analysis.results.slice(0,20).map(r => (
-                <div className="comment-row" key={r.id}>
-                  <div className="avatar">{initials(r.username || 'IG')}</div>
-                  <div className="comment-main">
-                    <div><strong>{r.username ? `@${r.username}` : 'Instagram user'}</strong><span>♥ {fmt(r.likes)}</span></div>
-                    <p>{r.comment}</p>
-                    <small>{r.topic} • {r.emotion} • {Math.round(r.confidence * 100)}% confidence</small>
-                  </div>
-                  <Pill tone={r.sentiment}>{r.sentiment}</Pill>
-                </div>
-              ))}
-            </div>
-          </div>
-        </>
       )}
     </div>
   )
@@ -586,38 +724,81 @@ function App() {
   const [sentiment,setSentiment]=useState(null)
 
   useEffect(()=>{
-    fetch(`${API}/api/campaign`).then(r=>r.ok?r.json():Promise.reject()).then(setCampaign)
-      .catch(()=>fetch('/campaign.json').then(r=>r.json()).then(data=>{
-        const totalReach=data.records.reduce((s,r)=>s+r.reach,0)
-        const totalEngagement=data.records.reduce((s,r)=>s+r.engagement,0)
-        const totalFollowers=data.records.reduce((s,r)=>s+r.followers,0)
-        const cats=[...new Set(data.records.map(r=>r.category))].map(name=>{
-          const rs=data.records.filter(r=>r.category===name)
-          return {name,creators:rs.length,deliverables:rs.length,followers:rs.reduce((s,r)=>s+r.followers,0),reach:rs.reduce((s,r)=>s+r.reach,0),engagement:rs.reduce((s,r)=>s+r.engagement,0),engagementRate:rs.reduce((s,r)=>s+r.reach,0)?rs.reduce((s,r)=>s+r.engagement,0)/rs.reduce((s,r)=>s+r.reach,0)*100:0}
-        })
-        setCampaign({meta:data.meta,summary:{totalCreators:data.records.length,totalPosts:data.records.length,totalFollowers,totalReach,totalEngagement,engagementRateReach:totalEngagement/totalReach*100,avgReachPerPost:totalReach/data.records.length},categories:cats,records:data.records})
-      })).catch(console.error)
+    fetch(`${API}/api/campaign`)
+      .then(r=>r.ok?r.json():Promise.reject(new Error('Campaign API unavailable')))
+      .then(setCampaign)
+      .catch(()=>fetch('/campaign.json')
+        .then(r=>r.json())
+        .then(data=>{
+          const totalReach=data.records.reduce((s,r)=>s+r.reach,0)
+          const totalEngagement=data.records.reduce((s,r)=>s+r.engagement,0)
+          const totalFollowers=data.records.reduce((s,r)=>s+r.followers,0)
+          const cats=[...new Set(data.records.map(r=>r.category))].map(name=>{
+            const rs=data.records.filter(r=>r.category===name)
+            const reach=rs.reduce((s,r)=>s+r.reach,0)
+            const engagement=rs.reduce((s,r)=>s+r.engagement,0)
+            return {name,creators:rs.length,deliverables:rs.length,followers:rs.reduce((s,r)=>s+r.followers,0),reach,engagement,engagementRate:reach?engagement/reach*100:0}
+          })
+          setCampaign({
+            meta:data.meta,
+            summary:{
+              totalCreators:data.records.length,
+              totalPosts:data.records.length,
+              totalFollowers,
+              totalReach,
+              totalEngagement,
+              engagementRateReach:totalReach?totalEngagement/totalReach*100:0,
+              avgReachPerPost:data.records.length?totalReach/data.records.length:0
+            },
+            categories:cats,
+            records:data.records
+          })
+        }))
+      .catch(console.error)
   },[])
+
+  function handleLivePost(id, livePost) {
+    if (!livePost) return
+
+    setCampaign(prev => {
+      if (!prev) return prev
+
+      return {
+        ...prev,
+        records: prev.records.map(record =>
+          record.id === id
+            ? { ...record, ...livePost }
+            : record
+        ),
+      }
+    })
+  }
 
   if(!campaign) return <div className="loading"><div className="loader"/><span>Loading campaign intelligence…</span></div>
 
-  const go=(page,id)=>{setActive(page); if(id) setFocusedId(id)}
+  const go=(page,id)=>{
+    setActive(page)
+    if(id) setFocusedId(id)
+  }
 
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark">M</div><div><strong>monk-e</strong><span>campaign intelligence</span></div></div>
       <div className="campaign-switch"><span>Active campaign</span><strong>{campaign.meta.campaign}</strong><small>{campaign.meta.platform} · {campaign.meta.date}</small></div>
       <nav>{navItems.map(([key,label,Icon])=><button key={key} className={active===key?'active':''} onClick={()=>go(key)}><Icon size={17}/><span>{label}</span>{key==='sentiment'&&<Pill>AI</Pill>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="status-dot"/><div><strong>Data connected</strong><span>{campaign.summary.totalPosts} placements loaded</span></div></div>
+      <div className="sidebar-bottom"><div className="status-dot"/><div><strong>Campaign data connected</strong><span>{campaign.summary.totalPosts} placements loaded</span></div></div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><span className="eyebrow">Monk-E / Campaign dashboard</span><h1>{navItems.find(x=>x[0]===active)?.[1]}</h1></div><div className="top-actions"><div className="live-pill"><span className="status-dot"/>Live sheet</div><button className="icon-btn"><ChevronDown size={16}/></button></div></header>
-      {active==='overview' && <Overview campaign={campaign} onGo={go}/>}
-      {active==='posts' && <Posts campaign={campaign} focusedId={focusedId}/>}
-      {active==='creators' && <Creators campaign={campaign}/>}
-      {active==='categories' && <Categories campaign={campaign}/>}
-      {active==='sentiment' && <Sentiment campaign={campaign} sentiment={sentiment} setSentiment={setSentiment}/>}
-      {active==='insights' && <Insights campaign={campaign}/>}
+      <header className="topbar">
+        <div><span className="eyebrow">Monk-E / Campaign dashboard</span><h1>{navItems.find(x=>x[0]===active)?.[1]}</h1></div>
+        <div className="top-actions"><div className="live-pill"><span className="status-dot"/>Instagram sync on demand</div><button className="icon-btn"><ChevronDown size={16}/></button></div>
+      </header>
+      {active==='overview' && <Overview campaign={campaign} onGo={go}/>} 
+      {active==='posts' && <Posts campaign={campaign} focusedId={focusedId}/>} 
+      {active==='creators' && <Creators campaign={campaign}/>} 
+      {active==='categories' && <Categories campaign={campaign}/>} 
+      {active==='sentiment' && <Sentiment campaign={campaign} sentiment={sentiment} setSentiment={setSentiment} onLive={handleLivePost}/>} 
+      {active==='insights' && <Insights campaign={campaign}/>} 
     </main>
   </div>
 }
