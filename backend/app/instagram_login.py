@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-from .instagram_web import PROFILE_DIR
+from .instagram_web import PROFILE_DIR, STORAGE_STATE_PATH
 from playwright.sync_api import sync_playwright
 
 
 def main() -> None:
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 64)
-    print("MONK-E INSTAGRAM LOGIN")
-    print("=" * 64)
-    print(f"Profile directory: {PROFILE_DIR}")
+    print("=" * 68)
+    print("MONK-E INSTAGRAM ONE-TIME LOGIN")
+    print("=" * 68)
+    print(f"Browser profile: {PROFILE_DIR}")
+    print(f"Storage state:   {STORAGE_STATE_PATH}")
     print("A Chromium window will open.")
-    print("Log in to the Instagram account manually.")
-    print("When you can browse the account normally, return here and press ENTER.")
+    print("Log into the Instagram account manually.")
+    print("Do not close the browser until the session is verified.")
 
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
@@ -26,13 +27,21 @@ def main() -> None:
 
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
-            input("\nPress ENTER after login/session verification... ")
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            input("\nAfter login is complete, press ENTER here... ")
+            context.storage_state(
+                path=str(STORAGE_STATE_PATH),
+                indexed_db=True,
+            )
         finally:
             context.close()
 
-    print("Instagram browser session saved.")
-    print(f"Profile: {PROFILE_DIR}")
+    print("Instagram storage state saved successfully.")
+    print(STORAGE_STATE_PATH)
 
 
 if __name__ == "__main__":

@@ -45,22 +45,10 @@ def _instagram_short_code(post_url: str) -> str:
 
 
 def _instagram_thumbnail_url(post_url: str) -> str:
-    """
-    Instagram's media URL is used as the lightweight thumbnail source.
-    If Instagram blocks the request, the frontend falls back to a local card.
-    """
-    shortcode = _instagram_short_code(post_url)
-    if not shortcode:
-        return ""
-
-    try:
-        path = urlparse(post_url).path.lower()
-        kind = "reel" if "/reel" in path else "p"
-    except Exception:
-        kind = "p"
-
-    return f"https://www.instagram.com/{kind}/{shortcode}/media/?size=l"
-
+    # Instagram media URLs are not stable public thumbnail endpoints.
+    # The Playwright service resolves the real og:image URL when a card is visible.
+    _ = post_url
+    return ""
 
 def load_campaign(path: str | Path) -> dict[str, Any]:
     path = Path(path)

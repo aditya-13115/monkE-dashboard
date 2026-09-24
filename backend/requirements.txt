@@ -3,6 +3,6 @@ uvicorn[standard]>=0.30
 pandas>=2.2
 openpyxl>=3.1
 pydantic>=2.8
-python-multipart>=0.0.9
 python-dotenv>=1.0
 groq>=0.31
+playwright>=1.50

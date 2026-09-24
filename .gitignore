@@ -45,3 +45,5 @@ instagram_debug.html
 Thumbs.db
 .vscode/
 .idea/
+
+data/instagram_cache/

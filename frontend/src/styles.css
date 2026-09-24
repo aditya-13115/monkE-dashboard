@@ -102,3 +102,56 @@ nav button .pill{margin-left:auto}
 @media(max-width:1400px){.sentiment-post-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:1100px){.sentiment-post-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.selected-post-banner{grid-template-columns:60px 1fr}.selected-post-actions{grid-column:2;justify-content:flex-start}}
 @media(max-width:800px){.sentiment-post-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* ===== v5 cache + modular sentiment refinements ===== */
+.spin{animation:spin 1s linear infinite}
+.inline-loader{display:flex;align-items:center;gap:9px;color:#777d89;font-size:11px;padding:24px}
+.inline-loader .loader{width:16px;height:16px;border-width:2px}
+.data-source-strip{display:flex;flex-wrap:wrap;gap:8px 18px;margin:-5px 0 16px;padding:10px 12px;border:1px solid #e8e6f2;background:#fbfaff;border-radius:11px;color:#777180;font-size:10px;line-height:1.45}
+.data-source-strip b{color:#6040ba}
+.cache-warning{margin:12px 34px 0;padding:9px 12px;border-radius:10px;border:1px solid #e8e0c5;background:#fffaf0;color:#7e6b37;font-size:10px}
+.error-loading{color:#a33d50;text-align:center}
+.error-loading strong{font-size:14px;color:#30333c}
+.error-loading span{font-size:11px;color:#7a7f89}
+.chart-empty{min-height:310px;display:grid;place-items:center;text-align:center;padding:30px;color:#8a8f9c;font-size:11px;border:1px dashed #dfe1e8;border-radius:12px;background:#fbfbfd}
+.drawer-actions{grid-column:1/-1;display:flex;align-items:center;justify-content:flex-end;gap:10px}
+
+.sentiment-post-card{cursor:pointer}
+.sentiment-post-card.selected{grid-column:1/-1;cursor:default}
+.sentiment-card-main{display:grid;grid-template-columns:190px minmax(0,1fr);min-height:190px}
+.sentiment-card-main .sentiment-thumb{aspect-ratio:auto;height:100%;min-height:190px}
+.selected-card-toolbar{padding:11px 14px;border-top:1px solid #efedf3;border-bottom:1px solid #efedf3;background:#fcfbff;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.selected-card-toolbar>div:first-child{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.selected-card-toolbar strong{font:700 13px 'Space Grotesk'}
+.sentiment-inline-analysis{padding:15px;background:#fdfcff}
+.sentiment-inline-analysis h3{font:700 17px 'Space Grotesk';margin:3px 0 5px;letter-spacing:-.03em}
+.sentiment-inline-analysis p{margin:0;color:#858a95;font-size:10px;line-height:1.45}
+.sentiment-inline-head{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:12px}
+.sentiment-inline-metrics{grid-template-columns:repeat(5,minmax(0,1fr));margin:0 0 12px}
+.sentiment-inline-metrics .metric-card{box-shadow:none;background:#fff}
+.sentiment-inline-grid{margin:0 0 12px}
+.nested-panel{box-shadow:none;background:#fff}
+.comments-panel{margin:0}
+.loading-state{display:flex;align-items:center;gap:13px;border-top:1px solid #eceaf0}
+.sentiment-analysis-loader{width:34px;height:34px;display:grid;place-items:center;background:#f0ebff;border-radius:11px}
+.sentiment-analysis-loader .loader{width:18px;height:18px;border-width:2px}
+.error-state{display:flex;align-items:center;justify-content:space-between;gap:14px;border-top:1px solid #ffd8df;background:#fff8f9}
+.analysis-note{margin-top:15px;padding:8px 9px;background:#fffaf0;border:1px solid #eee1bf;border-radius:8px;color:#7e6c3f;font-size:9px;line-height:1.4}
+.live-cache-age{display:block;margin-top:5px;color:#a0a4ae;font-size:8px}
+.sentiment-card-cta{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-top:1px solid #f0eff4;color:#858995;font-size:9px;background:#fcfcfe}
+.sentiment-card-cta span:last-child{font-size:12px;color:#8b5cf6}
+
+@media(max-width:1400px){
+  .sentiment-inline-metrics{grid-template-columns:repeat(5,minmax(110px,1fr))}
+}
+@media(max-width:1100px){
+  .sentiment-card-main{grid-template-columns:140px minmax(0,1fr)}
+  .sentiment-inline-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .sentiment-inline-head{align-items:flex-start;flex-direction:column}
+}
+@media(max-width:800px){
+  .sentiment-card-main{grid-template-columns:1fr}
+  .sentiment-card-main .sentiment-thumb{height:auto;aspect-ratio:1/1}
+  .selected-card-toolbar{align-items:flex-start;flex-direction:column}
+  .sentiment-inline-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
