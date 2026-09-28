@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -40,7 +41,7 @@ STORAGE_STATE_PATH = PROFILE_DIR / "storage_state.json"
 CACHE_DIR = BASE_DIR / "data" / "instagram_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-COMMENT_EXTRACTION_VERSION = "2026-09-29-2"
+COMMENT_EXTRACTION_VERSION = "2026-09-29-3"
 
 POST_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(p|reel|reels)/([^/?#]+)/?",
@@ -116,27 +117,43 @@ def _is_month_date(value: str) -> bool:
 
 class InstagramBrowser:
     """
-    One shared Playwright browser/context/page for the entire FastAPI process.
+    Persistent Instagram browser service with bounded parallel workers.
 
-    The Playwright objects are created and used on the same dedicated worker
-    thread. This avoids both:
-      1. Windows asyncio subprocess issues with the Sync API.
-      2. The 'popup bomb' caused by launching a browser per card/request.
+    Each executor worker owns its own Playwright Sync API instance, browser,
+    context, and page. This is important because Playwright Sync API objects
+    are thread-affine. The workers are reused across fetches, so a bulk campaign
+    sync can process several Instagram URLs concurrently without creating a new
+    browser for every request.
+
+    When visible debug mode is enabled, concurrency is deliberately reduced to
+    one worker by default to avoid the old multi-window/popup-bomb behaviour.
+    Set INSTAGRAM_ALLOW_VISIBLE_PARALLEL=true only when you explicitly want
+    multiple visible browser windows.
     """
 
     def __init__(self) -> None:
+        configured = max(1, min(10, int(os.getenv("INSTAGRAM_FETCH_CONCURRENCY", "8"))))
+        if not _env_bool("INSTAGRAM_HEADLESS", True) and not _env_bool(
+            "INSTAGRAM_ALLOW_VISIBLE_PARALLEL", False
+        ):
+            configured = 1
+
+        self._fetch_concurrency = configured
         self._executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=configured,
             thread_name_prefix="monke-instagram",
         )
-        self._playwright = None
-        self._browser: Browser | None = None
-        self._context: BrowserContext | None = None
-        self._page: Page | None = None
-        self._started = False
+        self._thread_local = threading.local()
+        self._session_lock = threading.RLock()
+        self._cache_lock = threading.RLock()
+        self._sessions: dict[int, dict[str, Any]] = {}
         self._closed = False
         self._post_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._cache_ttl = int(os.getenv("INSTAGRAM_CACHE_SECONDS", "1800"))
+        self._empty_comment_retry_ttl = max(
+            60,
+            int(os.getenv("INSTAGRAM_EMPTY_COMMENT_RETRY_SECONDS", "900")),
+        )
         self._cache_store = JsonCacheStore(CACHE_DIR / "post_live.json")
 
     async def _run(self, fn, *args):
@@ -146,19 +163,20 @@ class InstagramBrowser:
         return await loop.run_in_executor(self._executor, lambda: fn(*args))
 
     def _cache_get_sync(self, normalized: str) -> dict[str, Any] | None:
-        memory = self._post_cache.get(normalized)
-        if memory is not None:
-            return json.loads(json.dumps(memory[1]))
+        with self._cache_lock:
+            memory = self._post_cache.get(normalized)
+            if memory is not None:
+                return json.loads(json.dumps(memory[1]))
 
-        disk = self._cache_store.get(normalized)
-        if not isinstance(disk, dict):
-            return None
+            disk = self._cache_store.get(normalized)
+            if not isinstance(disk, dict):
+                return None
 
-        self._post_cache[normalized] = (
-            time.monotonic(),
-            json.loads(json.dumps(disk)),
-        )
-        return json.loads(json.dumps(disk))
+            self._post_cache[normalized] = (
+                time.monotonic(),
+                json.loads(json.dumps(disk)),
+            )
+            return json.loads(json.dumps(disk))
 
     def _cache_age_seconds_sync(self, normalized: str) -> float | None:
         entry = self._cache_store.get_entry(normalized)
@@ -176,12 +194,28 @@ class InstagramBrowser:
 
     def _cache_save_sync(self, normalized: str, data: dict[str, Any]) -> None:
         snapshot = json.loads(json.dumps(data))
-        self._post_cache[normalized] = (time.monotonic(), snapshot)
-        self._cache_store.set(normalized, snapshot)
+        with self._cache_lock:
+            self._post_cache[normalized] = (time.monotonic(), snapshot)
+            self._cache_store.set(normalized, snapshot)
 
-    def _ensure_started_sync(self) -> None:
-        if self._started and self._page is not None:
-            return
+    def _ensure_started_sync(self) -> Page:
+        session = getattr(self._thread_local, "session", None)
+        if session is not None:
+            page = session.get("page")
+            if page is not None:
+                try:
+                    if not page.is_closed():
+                        return page
+                except Exception:
+                    pass
+
+        if self._closed:
+            raise InstagramWebError("Instagram browser service is closed.")
+
+        # A crashed/closed worker page should not leave its old browser session
+        # hanging around before the worker creates a replacement.
+        if session is not None:
+            self._safe_close_sync()
 
         if not STORAGE_STATE_PATH.exists():
             raise InstagramWebError(
@@ -189,51 +223,58 @@ class InstagramBrowser:
                 "Run 'uv run python -m app.instagram_login' once and log in manually."
             )
 
-        self.PROFILE_DIR = PROFILE_DIR
-        self._playwright = sync_playwright().start()
-
+        playwright = sync_playwright().start()
         try:
-            self._browser = self._playwright.chromium.launch(
+            browser = playwright.chromium.launch(
                 headless=_env_bool("INSTAGRAM_HEADLESS", True),
             )
-            self._context = self._browser.new_context(
+            context = browser.new_context(
                 storage_state=str(STORAGE_STATE_PATH),
                 viewport={"width": 1440, "height": 1000},
                 locale="en-US",
                 timezone_id="Asia/Kolkata",
                 java_script_enabled=True,
             )
-            self._context.set_default_timeout(8_000)
-            self._context.set_default_navigation_timeout(
+            context.set_default_timeout(8_000)
+            context.set_default_navigation_timeout(
                 int(os.getenv("INSTAGRAM_TIMEOUT_MS", "45000"))
             )
-            self._page = self._context.new_page()
-            self._started = True
+            page = context.new_page()
+            session = {
+                "playwright": playwright,
+                "browser": browser,
+                "context": context,
+                "page": page,
+            }
+            self._thread_local.session = session
+            with self._session_lock:
+                self._sessions[threading.get_ident()] = session
+            return page
         except Exception:
-            self._safe_close_sync()
+            try:
+                playwright.stop()
+            except Exception:
+                pass
             raise
 
     def _safe_close_sync(self) -> None:
-        self._started = False
+        session = getattr(self._thread_local, "session", None)
+        if not session:
+            return
+        self._thread_local.session = None
+        with self._session_lock:
+            self._sessions.pop(threading.get_ident(), None)
+        for key in ("context", "browser"):
+            try:
+                obj = session.get(key)
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
         try:
-            if self._context is not None:
-                self._context.close()
+            session.get("playwright").stop()
         except Exception:
             pass
-        try:
-            if self._browser is not None:
-                self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._playwright is not None:
-                self._playwright.stop()
-        except Exception:
-            pass
-        self._page = None
-        self._context = None
-        self._browser = None
-        self._playwright = None
 
     def _dismiss_popups_sync(self, page: Page) -> None:
         for label in (
@@ -489,57 +530,89 @@ class InstagramBrowser:
         seen: set[str],
     ) -> None:
         if isinstance(payload, dict):
-            text = payload.get("text")
+            text = (
+                payload.get("text")
+                or payload.get("comment_text")
+                or payload.get("body")
+            )
+
             owner = payload.get("owner")
             user = payload.get("user")
-            owner_obj = owner if isinstance(owner, dict) else user if isinstance(user, dict) else None
+            author = payload.get("author")
+            creator = payload.get("created_by")
+            owner_obj = next(
+                (
+                    value
+                    for value in (owner, user, author, creator)
+                    if isinstance(value, dict)
+                    and (
+                        value.get("username")
+                        or value.get("handle")
+                        or value.get("user_name")
+                    )
+                ),
+                None,
+            )
+
             username = ""
             if owner_obj:
                 username = str(
                     owner_obj.get("username")
                     or owner_obj.get("handle")
+                    or owner_obj.get("user_name")
                     or ""
                 ).strip()
+
             typename = str(payload.get("__typename", "")).lower()
             internal_typename = str(payload.get("_typename", "")).lower()
+            key_text = " ".join(str(key).lower() for key in payload.keys())
+
             looks_like_comment = bool(
                 isinstance(text, str)
                 and text.strip()
+                and username
                 and (
-                    payload.get("pk")
-                    or payload.get("comment_id")
+                    payload.get("comment_id")
                     or "comment" in typename
                     or "comment" in internal_typename
+                    or "comment_like_count" in payload
+                    or "parent_comment_id" in payload
+                    or "comments" in key_text
                 )
-                and username
             )
+
             if looks_like_comment:
                 comment = text.strip()
                 comment_id = str(
                     payload.get("pk")
                     or payload.get("comment_id")
+                    or payload.get("id")
                     or f"{username}:{comment}"
                 )
                 if comment_id not in seen:
                     seen.add(comment_id)
+                    likes = (
+                        payload.get("like_count")
+                        or payload.get("comment_like_count")
+                        or payload.get("likes")
+                        or 0
+                    )
                     output.append(
                         {
                             "comment": comment,
-                            "likes": _to_int(
-                                payload.get(
-                                    "like_count",
-                                    payload.get("comment_like_count", 0),
-                                )
-                            ),
+                            "likes": _to_int(likes),
                             "post_url": post_url,
                             "username": username,
                         }
                     )
+
             for value in payload.values():
                 self._extract_comments_from_json_sync(value, post_url, output, seen)
+
         elif isinstance(payload, list):
             for value in payload:
                 self._extract_comments_from_json_sync(value, post_url, output, seen)
+
 
     def _extract_comments_from_html_sync(
         self,
@@ -564,8 +637,8 @@ class InstagramBrowser:
         for match in pattern.finditer(html_text):
             text = html.unescape(match.group(1) or "").strip()
             if not text or not any(
-                marker in text
-                for marker in ("comments_connection", "XIGComment", "comment_like_count")
+                marker in text.lower()
+                for marker in ("comment", "comments_connection", "xigcomment", "xdtcomment", "comment_like_count")
             ):
                 continue
             try:
@@ -601,8 +674,8 @@ class InstagramBrowser:
         for raw in script_texts:
             text = str(raw or "").strip()
             if not text or not any(
-                marker in text
-                for marker in ("comments_connection", "XIGComment", "comment_like_count")
+                marker in text.lower()
+                for marker in ("comment", "comments_connection", "xigcomment", "xdtcomment", "comment_like_count")
             ):
                 continue
             try:
@@ -611,7 +684,9 @@ class InstagramBrowser:
                 continue
             self._extract_comments_from_json_sync(payload, post_url, output, seen)
 
-    def _click_comment_controls_sync(self, page: Page) -> None:
+    def _click_comment_controls_sync(self, page: Page) -> bool:
+        """Open Instagram's comment surface using several stable UI strategies."""
+        clicked = False
         patterns = [
             r"view all .*comments?",
             r"view .*more comments?",
@@ -619,29 +694,52 @@ class InstagramBrowser:
             r"load more comments?",
             r"view comments",
         ]
+
         for pattern in patterns:
             for strategy in ("button", "text"):
                 try:
-                    if strategy == "button":
-                        locator = page.get_by_role(
-                            "button",
-                            name=re.compile(pattern, re.IGNORECASE),
-                        )
-                    else:
-                        locator = page.get_by_text(
-                            re.compile(pattern, re.IGNORECASE),
-                            exact=False,
-                        )
+                    locator = (
+                        page.get_by_role("button", name=re.compile(pattern, re.IGNORECASE))
+                        if strategy == "button"
+                        else page.get_by_text(re.compile(pattern, re.IGNORECASE), exact=False)
+                    )
                     for i in range(min(locator.count(), 4)):
                         try:
                             item = locator.nth(i)
                             if item.is_visible():
                                 item.click(timeout=1_500)
-                                page.wait_for_timeout(800)
+                                clicked = True
+                                page.wait_for_timeout(700)
                         except Exception:
                             continue
                 except Exception:
                     continue
+
+        # Reels often expose only an icon/button whose accessible name contains
+        # "comment". Avoid reply/input controls and click the first useful action.
+        try:
+            locator = page.get_by_role(
+                "button",
+                name=re.compile(r"comment", re.IGNORECASE),
+            )
+            for i in range(min(locator.count(), 8)):
+                try:
+                    button = locator.nth(i)
+                    if not button.is_visible():
+                        continue
+                    label = (button.get_attribute("aria-label") or "").lower()
+                    if any(token in label for token in ("reply", "add a comment", "send")):
+                        continue
+                    button.click(timeout=1_500)
+                    clicked = True
+                    page.wait_for_timeout(900)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return clicked
 
     def _scroll_comments_sync(self, page: Page) -> None:
         try:
@@ -660,6 +758,19 @@ class InstagramBrowser:
         except Exception:
             pass
 
+    def _comments_cache_usable_sync(
+        self,
+        cached: dict[str, Any],
+        age: float | None,
+    ) -> bool:
+        """Only reuse a comment cache when the extractor actually found comments."""
+        _ = age
+        if not cached.get("commentsFetchAttempted", False):
+            return False
+        if cached.get("commentExtractionVersion") != COMMENT_EXTRACTION_VERSION:
+            return False
+        return int(cached.get("commentsExtracted", 0) or 0) > 0
+
     def _fetch_post_sync(
         self,
         post_url: str,
@@ -676,13 +787,12 @@ class InstagramBrowser:
                 # complete analysis-source cache. An empty commentsData list
                 # is still a valid cached result for a post with no exposed
                 # comments, so do not use truthiness of the list itself.
-                comments_fetched = (
-                    bool(cached.get("commentsFetchAttempted", False))
-                    and cached.get("commentExtractionVersion") == COMMENT_EXTRACTION_VERSION
-                )
                 age = self._cache_age_seconds_sync(normalized)
                 fresh = age is None or age <= self._cache_ttl
-                cache_is_usable = (not include_comments or comments_fetched)
+                cache_is_usable = (
+                    not include_comments
+                    or self._comments_cache_usable_sync(cached, age)
+                )
 
                 # Persistent cache is intentionally served even when stale.
                 # Refreshing live data is an explicit user action (`force=true`)
@@ -696,9 +806,7 @@ class InstagramBrowser:
         # Only start Chromium when a network fetch is actually required.
         # This keeps cache-only page loads working even if the Instagram login
         # state is unavailable or Chromium is temporarily unavailable.
-        self._ensure_started_sync()
-        assert self._page is not None
-        page = self._page
+        page = self._ensure_started_sync()
 
         response_comments: list[dict[str, Any]] = []
         response_seen: set[str] = set()
@@ -733,10 +841,10 @@ class InstagramBrowser:
             except PlaywrightTimeoutError:
                 pass
 
-            page.wait_for_timeout(int(os.getenv("INSTAGRAM_INITIAL_WAIT_MS", "1500")))
+            page.wait_for_timeout(int(os.getenv("INSTAGRAM_INITIAL_WAIT_MS", "1800")))
             self._dismiss_popups_sync(page)
             self._click_comment_controls_sync(page)
-            page.wait_for_timeout(int(os.getenv("INSTAGRAM_COMMENT_WAIT_MS", "500")))
+            page.wait_for_timeout(int(os.getenv("INSTAGRAM_COMMENT_WAIT_MS", "700")))
 
             body = self._body_text_sync(page)
             description = self._meta_sync(
@@ -794,11 +902,18 @@ class InstagramBrowser:
             # Scroll only when comments are requested. Preview/thumbnail calls
             # do not need to hammer the page by loading the full comment list.
             if include_comments:
-                for _ in range(max(1, int(os.getenv("INSTAGRAM_COMMENT_ROUNDS", "6")))):
+                rounds = max(1, int(os.getenv("INSTAGRAM_COMMENT_ROUNDS", "6")))
+                stagnant_rounds = 0
+                previous_count = len(comments)
+
+                for round_index in range(rounds):
                     if len(comments) >= comment_limit:
                         break
-                    self._scroll_comments_sync(page)
+
                     self._click_comment_controls_sync(page)
+                    self._scroll_comments_sync(page)
+                    page.wait_for_timeout(350 if round_index else 500)
+
                     updated_body = self._body_text_sync(page)
                     more = self._extract_comments_from_text_sync(
                         updated_body,
@@ -819,7 +934,17 @@ class InstagramBrowser:
                         if key not in existing:
                             existing.add(key)
                             comments.append(row)
-                    if len(comments) >= comment_limit:
+
+                    if len(comments) == previous_count:
+                        stagnant_rounds += 1
+                    else:
+                        stagnant_rounds = 0
+                    previous_count = len(comments)
+
+                    # If Instagram did not add anything after two attempts,
+                    # stop rather than spending 5-10x longer on a page that
+                    # simply exposes no additional public comments.
+                    if stagnant_rounds >= 2:
                         break
 
                 for row in response_comments:
@@ -850,8 +975,9 @@ class InstagramBrowser:
                 "engagement": engagement,
                 "commentsData": comments[:comment_limit],
                 "commentsExtracted": len(comments),
-                "commentsFetched": bool(include_comments),
+                "commentsFetched": bool(include_comments and comments),
                 "commentsFetchAttempted": bool(include_comments),
+                "commentsEmptyConfirmed": bool(include_comments and not comments),
                 "commentExtractionVersion": COMMENT_EXTRACTION_VERSION,
                 "source": "instagram_web",
                 "lastSyncedAt": time.time(),
@@ -890,12 +1016,25 @@ class InstagramBrowser:
         self._closed = True
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(self._executor, self._safe_close_sync)
+            # Wake multiple worker threads so each thread gets a chance to close
+            # its own thread-affine Playwright session.
+            await asyncio.gather(
+                *(
+                    loop.run_in_executor(self._executor, self._safe_close_sync)
+                    for _ in range(self._fetch_concurrency)
+                ),
+                return_exceptions=True,
+            )
         finally:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 _BROWSER = InstagramBrowser()
+
+
+def get_instagram_fetch_concurrency() -> int:
+    """Return the actual worker count after visible/headless safety rules."""
+    return int(_BROWSER._fetch_concurrency)
 
 
 def get_cached_post_data(post_url: str) -> dict[str, Any] | None:

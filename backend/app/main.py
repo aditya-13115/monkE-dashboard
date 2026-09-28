@@ -26,6 +26,7 @@ from .instagram_web import (
     fetch_post_analysis_source,
     fetch_post_preview,
     get_all_cached_post_data,
+    get_instagram_fetch_concurrency,
     get_cached_post_data,
     normalize_instagram_url,
     shutdown_instagram_browser,
@@ -50,6 +51,14 @@ SENTIMENT_CACHE_SECONDS = max(300, int(os.getenv("SENTIMENT_CACHE_SECONDS", "864
 CAMPAIGN_SENTIMENT_CACHE_SECONDS = max(300, int(os.getenv("CAMPAIGN_SENTIMENT_CACHE_SECONDS", "86400")))
 CAMPAIGN_COMMENTS_PER_POST = max(1, min(25, int(os.getenv("CAMPAIGN_COMMENTS_PER_POST", "5"))))
 CAMPAIGN_SENTIMENT_MAX_COMMENTS = max(25, min(1000, int(os.getenv("CAMPAIGN_SENTIMENT_MAX_COMMENTS", "500"))))
+INSTAGRAM_SYNC_CONCURRENCY = min(
+    get_instagram_fetch_concurrency(),
+    max(1, min(10, int(os.getenv("INSTAGRAM_SYNC_CONCURRENCY", os.getenv("INSTAGRAM_FETCH_CONCURRENCY", "8"))))),
+)
+CAMPAIGN_SENTIMENT_FETCH_CONCURRENCY = min(
+    get_instagram_fetch_concurrency(),
+    max(1, min(10, int(os.getenv("CAMPAIGN_SENTIMENT_FETCH_CONCURRENCY", "5")))),
+)
 DEFAULT_XLSX = BASE_DIR / "data" / "ASIAN PAINTS (1).xlsx"
 LEGACY_XLSX_PATH = Path(os.getenv("CAMPAIGN_XLSX_PATH", str(DEFAULT_XLSX)))
 if not LEGACY_XLSX_PATH.is_absolute():
@@ -402,6 +411,8 @@ def health():
         "public_viewer_base_url": PUBLIC_VIEWER_BASE_URL,
         "persistent_cache_dir": str(CACHE_DIR),
         "sentiment_cache_seconds": SENTIMENT_CACHE_SECONDS,
+        "instagram_fetch_concurrency": INSTAGRAM_SYNC_CONCURRENCY,
+        "campaign_sentiment_fetch_concurrency": CAMPAIGN_SENTIMENT_FETCH_CONCURRENCY,
     }
 
 
@@ -555,47 +566,51 @@ async def _run_campaign_sync_job(job_id: str, campaign_id: str, force: bool) -> 
             job_id,
             total=len(records),
             phase="instagram",
-            message="Fetching public Instagram metrics and thumbnails…",
+            message=(
+                f"Fetching public Instagram details with up to "
+                f"{INSTAGRAM_SYNC_CONCURRENCY} parallel workers…"
+            ),
         )
+
         synced = 0
         cached = 0
         failed = 0
+        processed = 0
         errors: list[dict[str, Any]] = []
+        semaphore = asyncio.Semaphore(INSTAGRAM_SYNC_CONCURRENCY)
+        progress_lock = asyncio.Lock()
 
-        for index, post in enumerate(records, start=1):
+        async def fetch_one(index: int, post: dict[str, Any]) -> None:
+            nonlocal synced, cached, failed, processed
             post_url = str(post.get("postLink", "")).strip()
-            if not post_url:
-                failed += 1
-                errors.append({"postId": post.get("id"), "error": "Missing POST LINK"})
-                JOB_STORE.progress(
-                    job_id,
-                    index,
-                    message=f"Skipped post {index}/{len(records)}: missing POST LINK",
-                )
-                continue
-
-            try:
-                live = await fetch_post_preview(post_url, force=force)
-                if live.get("cacheHit"):
-                    cached += 1
+            async with semaphore:
+                if not post_url:
+                    failed += 1
+                    errors.append({"postId": post.get("id"), "error": "Missing POST LINK"})
+                    message = f"Skipped {index}/{len(records)}: missing POST LINK"
                 else:
-                    synced += 1
-                JOB_STORE.progress(
-                    job_id,
-                    index,
-                    message=(
-                        f"Fetched {index}/{len(records)}: @{post.get('username', 'Instagram')} "
-                        f"({post.get('postType', 'Post')})"
-                    ),
-                )
-            except Exception as exc:
-                failed += 1
-                errors.append({"postId": post.get("id"), "postUrl": post_url, "error": str(exc)})
-                JOB_STORE.progress(
-                    job_id,
-                    index,
-                    message=f"Failed {index}/{len(records)}: {exc}",
-                )
+                    try:
+                        live = await fetch_post_preview(post_url, force=force)
+                        if live.get("cacheHit"):
+                            cached += 1
+                        else:
+                            synced += 1
+                        message = (
+                            f"Fetched {index}/{len(records)}: @{post.get('username', 'Instagram')} "
+                            f"({post.get('postType', 'Post')})"
+                        )
+                    except Exception as exc:
+                        failed += 1
+                        errors.append({"postId": post.get("id"), "postUrl": post_url, "error": str(exc)})
+                        message = f"Failed {index}/{len(records)}: {exc}"
+
+                async with progress_lock:
+                    processed += 1
+                    JOB_STORE.progress(job_id, processed, message=message)
+
+        await asyncio.gather(
+            *(fetch_one(index, post) for index, post in enumerate(records, start=1))
+        )
 
         result = {
             "campaignId": campaign_id,
@@ -603,13 +618,15 @@ async def _run_campaign_sync_job(job_id: str, campaign_id: str, force: bool) -> 
             "fetchedLive": synced,
             "servedFromCache": cached,
             "failed": failed,
+            "concurrency": INSTAGRAM_SYNC_CONCURRENCY,
             "errors": errors[:20],
         }
         JOB_STORE.complete(
             job_id,
             result=result,
             message=(
-                f"Instagram sync complete: {synced} fetched, {cached} cache hits, {failed} failed."
+                f"Instagram sync complete: {synced} fetched, {cached} cache hits, "
+                f"{failed} failed using up to {INSTAGRAM_SYNC_CONCURRENCY} parallel workers."
             ),
         )
     except Exception as exc:
@@ -639,72 +656,120 @@ async def _run_campaign_sentiment_job(job_id: str, campaign_id: str, force: bool
             job_id,
             total=len(records),
             phase="comments",
-            message="Collecting random public comments from every post and reel…",
+            message=(
+                "Collecting random public comments from every post and reel "
+                f"with up to {CAMPAIGN_SENTIMENT_FETCH_CONCURRENCY} parallel workers…"
+            ),
         )
 
         rng = random.Random()
+        errors: list[str] = []
+        semaphore = asyncio.Semaphore(CAMPAIGN_SENTIMENT_FETCH_CONCURRENCY)
+
+        async def collect_one(index: int, post: dict[str, Any]) -> dict[str, Any]:
+            post_type = str(post.get("postType", "Post") or "Post")
+            post_url = str(post.get("postLink", "")).strip()
+            async with semaphore:
+                if not post_url:
+                    return {
+                        "index": index,
+                        "postId": post.get("id"),
+                        "postType": post_type,
+                        "comments": [],
+                        "selected": [],
+                        "error": f"Post {post.get('id')} has no POST LINK.",
+                        "message": f"Skipped {index}/{len(records)}: missing POST LINK",
+                    }
+                try:
+                    source = await fetch_post_analysis_source(
+                        post_url,
+                        comment_limit=min(100, max(CAMPAIGN_COMMENTS_PER_POST * 3, 10)),
+                        force=force,
+                    )
+                    comments = list(source.get("commentsData", []))
+                    selected = _sample_random_comments(
+                        comments,
+                        CAMPAIGN_COMMENTS_PER_POST,
+                        rng,
+                    )
+                    enriched: list[dict[str, Any]] = []
+                    for row in selected:
+                        item = dict(row)
+                        item["sourcePostId"] = post.get("id")
+                        item["postType"] = post_type
+                        item["creator"] = post.get("username", "")
+                        item["brand"] = post.get("brand", campaign.get("meta", {}).get("brand", ""))
+                        item["campaign"] = post.get("campaign", campaign.get("meta", {}).get("campaign", ""))
+                        enriched.append(item)
+                    return {
+                        "index": index,
+                        "postId": post.get("id"),
+                        "postType": post_type,
+                        "comments": comments,
+                        "selected": enriched,
+                        "error": None,
+                        "message": (
+                            f"Comments {index}/{len(records)}: {len(comments)} found, "
+                            f"{len(enriched)} sampled from @{post.get('username', 'Instagram')}"
+                        ),
+                    }
+                except Exception as exc:
+                    return {
+                        "index": index,
+                        "postId": post.get("id"),
+                        "postType": post_type,
+                        "comments": [],
+                        "selected": [],
+                        "error": f"{post.get('id')}: {exc}",
+                        "message": f"Comments {index}/{len(records)} failed: {exc}",
+                    }
+
+        results = await asyncio.gather(
+            *(collect_one(index, post) for index, post in enumerate(records, start=1))
+        )
+
         collected: list[dict[str, Any]] = []
         posts_with_comments = 0
-        reels_total = 0
+        reels_total = sum(
+            1 for post in records if str(post.get("postType", "Post")).lower() == "reel"
+        )
         reels_with_comments = 0
         total_comments_collected = 0
-        errors: list[str] = []
 
-        for index, post in enumerate(records, start=1):
-            post_type = str(post.get("postType", "Post") or "Post")
-            if post_type.lower() == "reel":
-                reels_total += 1
-            post_url = str(post.get("postLink", "")).strip()
-            if not post_url:
-                errors.append(f"Post {post.get('id')} has no POST LINK.")
-                JOB_STORE.progress(job_id, index, message=f"Skipped {index}/{len(records)}: missing POST LINK")
-                continue
+        # Re-assemble in campaign order so the dashboard remains deterministic
+        # even though the Instagram requests completed out of order.
+        results.sort(key=lambda item: int(item.get("index", 0)))
+        for result in results:
+            comments = list(result.get("comments", []))
+            selected = list(result.get("selected", []))
+            total_comments_collected += len(comments)
+            if comments:
+                posts_with_comments += 1
+                if str(result.get("postType", "Post")).lower() == "reel":
+                    reels_with_comments += 1
+            if result.get("error"):
+                errors.append(str(result["error"]))
+            for row in selected:
+                item = dict(row)
+                item["id"] = len(collected) + 1
+                collected.append(item)
 
-            try:
-                source = await fetch_post_analysis_source(
-                    post_url,
-                    comment_limit=min(100, max(CAMPAIGN_COMMENTS_PER_POST * 3, 10)),
-                    force=force,
-                )
-                comments = list(source.get("commentsData", []))
-                total_comments_collected += len(comments)
-                if comments:
-                    posts_with_comments += 1
-                    if post_type.lower() == "reel":
-                        reels_with_comments += 1
-                selected = _sample_random_comments(
-                    comments,
-                    CAMPAIGN_COMMENTS_PER_POST,
-                    rng,
-                )
-                for row in selected:
-                    enriched = dict(row)
-                    # Assign one globally unique numeric id across the whole
-                    # campaign. Groq returns this id and the campaign
-                    # aggregation then joins the sentiment result back to the
-                    # originating post/reel.
-                    enriched["id"] = len(collected) + 1
-                    enriched["sourcePostId"] = post.get("id")
-                    enriched["postType"] = post_type
-                    enriched["creator"] = post.get("username", "")
-                    enriched["brand"] = post.get("brand", campaign.get("meta", {}).get("brand", ""))
-                    enriched["campaign"] = post.get("campaign", campaign.get("meta", {}).get("campaign", ""))
-                    collected.append(enriched)
-                JOB_STORE.progress(
-                    job_id,
-                    index,
-                    message=f"Comments {index}/{len(records)}: {len(comments)} found, {len(selected)} sampled from @{post.get('username', 'Instagram')}",
-                )
-            except Exception as exc:
-                errors.append(f"{post.get('id')}: {exc}")
-                JOB_STORE.progress(
-                    job_id,
-                    index,
-                    message=f"Comments {index}/{len(records)} failed: {exc}",
-                )
+        # The collection phase has completed even if individual placements
+        # failed. Surface partial errors instead of hiding them.
+        JOB_STORE.progress(
+            job_id,
+            len(records),
+            message=(
+                f"Collected {len(collected)} sampled comments from "
+                f"{posts_with_comments}/{len(records)} placements "
+                f"({reels_with_comments}/{reels_total} reels with comments)."
+            ),
+        )
 
         if len(collected) > CAMPAIGN_SENTIMENT_MAX_COMMENTS:
             collected = rng.sample(collected, CAMPAIGN_SENTIMENT_MAX_COMMENTS)
+            for idx, row in enumerate(collected, start=1):
+                row["id"] = idx
 
         JOB_STORE.update(
             job_id,
@@ -722,7 +787,10 @@ async def _run_campaign_sentiment_job(job_id: str, campaign_id: str, force: bool
         )
         analysis["sample"] = {
             **analysis.get("sample", {}),
-            "strategy": f"Randomly sampled up to {CAMPAIGN_COMMENTS_PER_POST} comments per post/reel, then analyzed as one campaign audience sample.",
+            "strategy": (
+                f"Randomly sampled up to {CAMPAIGN_COMMENTS_PER_POST} comments per post/reel, "
+                "then analyzed as one campaign audience sample."
+            ),
             "perPostLimit": CAMPAIGN_COMMENTS_PER_POST,
             "maxCampaignComments": CAMPAIGN_SENTIMENT_MAX_COMMENTS,
         }
@@ -735,6 +803,8 @@ async def _run_campaign_sentiment_job(job_id: str, campaign_id: str, force: bool
             reel_posts=reels_total,
             reel_posts_with_comments=reels_with_comments,
         )
+        aggregate["errors"] = list(aggregate.get("errors", [])) + errors[:5]
+        aggregate["partial"] = bool(aggregate.get("partial") or errors)
         payload = {
             "campaignId": campaign_id,
             "analysis": {
@@ -749,7 +819,10 @@ async def _run_campaign_sentiment_job(job_id: str, campaign_id: str, force: bool
         JOB_STORE.complete(
             job_id,
             result=_public_campaign_sentiment(payload),
-            message=f"Campaign sentiment complete: {len(collected)} comments analyzed across {len(records)} posts/reels.",
+            message=(
+                f"Campaign sentiment complete: {len(collected)} comments analyzed "
+                f"across {len(records)} posts/reels."
+            ),
         )
         print(
             f"[Campaign sentiment] complete for {campaign_id}: {len(collected)} comments, "
