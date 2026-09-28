@@ -22,6 +22,7 @@ from .campaign_manager import CampaignManager, CampaignManagerError
 from .comment_source import InstagramFetchError
 from .data_loader import load_campaign
 from .instagram_web import (
+    InstagramWebError,
     STORAGE_STATE_PATH,
     fetch_post_analysis_source,
     fetch_post_preview,
@@ -966,7 +967,7 @@ async def _sentiment_for_post(campaign_id: str, post_id: int, force: bool = Fals
             flush=True,
         )
         return payload
-    except InstagramFetchError as exc:
+    except (InstagramFetchError, InstagramWebError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GroqKeysExhaustedError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc

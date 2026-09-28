@@ -18,6 +18,7 @@ from .cache_store import JsonCacheStore
 from playwright.sync_api import (
     Browser,
     BrowserContext,
+    Error as PlaywrightError,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
@@ -41,7 +42,8 @@ STORAGE_STATE_PATH = PROFILE_DIR / "storage_state.json"
 CACHE_DIR = BASE_DIR / "data" / "instagram_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-COMMENT_EXTRACTION_VERSION = "2026-09-29-3"
+COMMENT_EXTRACTION_VERSION = "2026-09-29-4"
+BROWSER_RECOVERY_ATTEMPTS = max(1, min(3, int(os.getenv("INSTAGRAM_BROWSER_RECOVERY_ATTEMPTS", "2"))))
 
 POST_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(p|reel|reels)/([^/?#]+)/?",
@@ -227,6 +229,12 @@ class InstagramBrowser:
         try:
             browser = playwright.chromium.launch(
                 headless=_env_bool("INSTAGRAM_HEADLESS", True),
+                args=[
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
             )
             context = browser.new_context(
                 storage_state=str(STORAGE_STATE_PATH),
@@ -771,7 +779,20 @@ class InstagramBrowser:
             return False
         return int(cached.get("commentsExtracted", 0) or 0) > 0
 
-    def _fetch_post_sync(
+    def _is_recoverable_browser_error(self, exc: BaseException) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "page crashed",
+                "browser has been closed",
+                "target page, context or browser has been closed",
+                "target closed",
+                "crashed",
+            )
+        )
+
+    def _fetch_post_once_sync(
         self,
         post_url: str,
         include_comments: bool,
@@ -833,9 +854,13 @@ class InstagramBrowser:
         page.on("response", on_response)
         try:
             try:
+                # `commit` returns as soon as the navigation commits, which
+                # makes recovery from a Chromium renderer crash much faster than
+                # waiting for DOMContentLoaded on an Instagram page that may keep
+                # long-running background requests alive.
                 page.goto(
                     normalized,
-                    wait_until="domcontentloaded",
+                    wait_until="commit",
                     timeout=int(os.getenv("INSTAGRAM_TIMEOUT_MS", "45000")),
                 )
             except PlaywrightTimeoutError:
@@ -993,6 +1018,84 @@ class InstagramBrowser:
                 page.remove_listener("response", on_response)
             except Exception:
                 pass
+
+    def _fetch_post_sync(
+        self,
+        post_url: str,
+        include_comments: bool,
+        comment_limit: int,
+        force: bool,
+    ) -> dict[str, Any]:
+        normalized = normalize_instagram_url(post_url)
+        last_error: BaseException | None = None
+
+        for attempt in range(1, BROWSER_RECOVERY_ATTEMPTS + 1):
+            try:
+                result = self._fetch_post_once_sync(
+                    normalized,
+                    include_comments,
+                    comment_limit,
+                    force,
+                )
+                if attempt > 1:
+                    result["browserRecovered"] = True
+                    result["browserRecoveryAttempt"] = attempt
+                return result
+            except PlaywrightError as exc:
+                last_error = exc
+                if not self._is_recoverable_browser_error(exc):
+                    raise
+
+                print(
+                    f"[Instagram] browser recovery {attempt}/{BROWSER_RECOVERY_ATTEMPTS} "
+                    f"for {normalized}: {exc}",
+                    flush=True,
+                )
+                self._safe_close_sync()
+
+                if attempt >= BROWSER_RECOVERY_ATTEMPTS:
+                    break
+
+                time.sleep(0.4 * attempt)
+
+            except Exception as exc:
+                # Some Playwright/Chromium builds surface renderer crashes
+                # through a generic RuntimeError rather than PlaywrightError.
+                last_error = exc
+                if not self._is_recoverable_browser_error(exc):
+                    raise
+
+                print(
+                    f"[Instagram] generic browser recovery {attempt}/{BROWSER_RECOVERY_ATTEMPTS} "
+                    f"for {normalized}: {exc}",
+                    flush=True,
+                )
+                self._safe_close_sync()
+
+                if attempt >= BROWSER_RECOVERY_ATTEMPTS:
+                    break
+
+                time.sleep(0.4 * attempt)
+
+        # A failed forced refresh should not destroy a previously successful
+        # sentiment workflow. If a complete cached analysis source exists, use
+        # it as a stale fallback instead of turning a renderer crash into HTTP 500.
+        cached = self._cache_get_sync(normalized)
+        cached_age = self._cache_age_seconds_sync(normalized)
+        if include_comments and isinstance(cached, dict) and self._comments_cache_usable_sync(cached, cached_age):
+            cached["cacheHit"] = True
+            cached["cacheFresh"] = False
+            cached["cacheFallback"] = True
+            cached["cacheAgeSeconds"] = round(cached_age or 0, 1)
+            cached["browserRecoveryFailed"] = True
+            return cached
+
+        detail = str(last_error) if last_error else "Unknown Chromium error"
+        raise InstagramWebError(
+            f"Instagram Chromium renderer crashed while opening {normalized}. "
+            f"The browser was restarted {BROWSER_RECOVERY_ATTEMPTS} time(s) but could not recover. "
+            f"Details: {detail}"
+        ) from last_error
 
     async def fetch_post(
         self,
