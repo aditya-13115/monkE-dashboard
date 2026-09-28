@@ -7,6 +7,7 @@ import SentimentInlineAnalysis from './SentimentInlineAnalysis'
 
 export default function LivePostCard({
   post,
+  campaignId,
   selected,
   analysis,
   analysisLoading,
@@ -24,7 +25,7 @@ export default function LivePostCard({
     setLoadingLive(true)
     setLocalError('')
     try {
-      const result = await fetchLivePost(post.id, true)
+      const result = await fetchLivePost(campaignId, post.id, true)
       onLive(post.id, result)
     } catch (err) {
       setLocalError(err?.message || 'Live refresh failed')

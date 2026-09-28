@@ -4,7 +4,7 @@ import { Avatar, LiveBadge, PostThumbnail, SectionHeader } from '../../component
 import { useLivePost, seedLivePost } from '../../hooks/useLivePost'
 import { fmt, pct } from '../../lib/metrics'
 
-export default function Posts({ campaign, focusedId }) {
+export default function Posts({ campaign, campaignId, focusedId }) {
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('All')
   const [type, setType] = useState('All')
@@ -33,8 +33,8 @@ export default function Posts({ campaign, focusedId }) {
     const cached = live[row.id] || (row.liveDataAvailable ? row : null)
     if (!cached) {
       try {
-        const result = await fetchLivePost(row.id)
-        seedLivePost(result)
+        const result = await fetchLivePost(campaignId, row.id)
+        seedLivePost(campaignId, result)
         setLive(prev => ({ ...prev, [row.id]: result }))
       } catch {
         // The workbook detail remains usable even when Instagram is unavailable.

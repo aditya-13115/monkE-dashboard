@@ -6,11 +6,11 @@ import { apiJson, endpoints } from '../../lib/api'
 import { cacheKeys, readCache, writeCache } from '../../lib/cache'
 import LivePostCard from './LivePostCard'
 
-export default function SentimentPage({ campaign, setCampaign }) {
+export default function SentimentPage({ campaign, campaignId, setCampaign }) {
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('All')
   const [type, setType] = useState('All')
-  const [selectedId, setSelectedId] = useState(() => readCache(cacheKeys.selectedSentimentPost))
+  const [selectedId, setSelectedId] = useState(() => readCache(cacheKeys.selectedSentimentPost(campaignId)))
   const [overrides, setOverrides] = useState({})
   const [sentiments, setSentiments] = useState({})
   const [loadingIds, setLoadingIds] = useState({})
@@ -19,7 +19,7 @@ export default function SentimentPage({ campaign, setCampaign }) {
   useEffect(() => {
     const selected = Number(selectedId || 0)
     if (!selected) return
-    const cached = readCache(cacheKeys.sentiment(selected))
+    const cached = readCache(cacheKeys.sentiment(campaignId, selected))
     if (cached) setSentiments(prev => ({ ...prev, [selected]: cached }))
   }, [selectedId])
 
@@ -35,7 +35,7 @@ export default function SentimentPage({ campaign, setCampaign }) {
 
   function updatePost(id, livePost) {
     if (!livePost) return
-    seedLivePost(livePost)
+    seedLivePost(campaignId, livePost)
     setOverrides(prev => ({ ...prev, [id]: livePost }))
     setCampaign(prev => prev ? ({
       ...prev,
@@ -47,11 +47,11 @@ export default function SentimentPage({ campaign, setCampaign }) {
     if (!post) return
     const id = post.id
     setSelectedId(id)
-    writeCache(cacheKeys.selectedSentimentPost, id)
+    writeCache(cacheKeys.selectedSentimentPost(campaignId), id)
     setErrors(prev => ({ ...prev, [id]: '' }))
 
     if (!force) {
-      const cached = sentiments[id] || readCache(cacheKeys.sentiment(id))
+      const cached = sentiments[id] || readCache(cacheKeys.sentiment(campaignId, id))
       if (cached) {
         setSentiments(prev => ({ ...prev, [id]: cached }))
         const cachedPost = cached.post
@@ -62,9 +62,9 @@ export default function SentimentPage({ campaign, setCampaign }) {
 
     setLoadingIds(prev => ({ ...prev, [id]: true }))
     try {
-      const data = await apiJson(endpoints.sentimentPost(id, force), { method: 'POST' })
+      const data = await apiJson(endpoints.sentimentPost(campaignId, id, force), { method: 'POST' })
       setSentiments(prev => ({ ...prev, [id]: data }))
-      writeCache(cacheKeys.sentiment(id), data)
+      writeCache(cacheKeys.sentiment(campaignId, id), data)
       if (data.post) updatePost(id, data.post)
     } catch (err) {
       setErrors(prev => ({ ...prev, [id]: err?.message || 'Sentiment analysis failed' }))
@@ -105,11 +105,12 @@ export default function SentimentPage({ campaign, setCampaign }) {
           <LivePostCard
             key={post.id}
             post={post}
+            campaignId={campaignId}
             selected={selectedId === post.id}
             analysis={sentiments[post.id]?.analysis}
             analysisLoading={Boolean(loadingIds[post.id])}
             analysisError={errors[post.id]}
-            onSelect={selected => { setSelectedId(selected.id); writeCache(cacheKeys.selectedSentimentPost, selected.id) }}
+            onSelect={selected => { setSelectedId(selected.id); writeCache(cacheKeys.selectedSentimentPost(campaignId), selected.id) }}
             onLive={updatePost}
             onAnalyze={analyzePost}
           />

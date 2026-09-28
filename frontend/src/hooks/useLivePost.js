@@ -5,11 +5,14 @@ import { cacheKeys, readCache, writeCache } from '../lib/cache'
 const inflight = new Map()
 const memory = new Map()
 
-function cachedPost(id) {
-  if (memory.has(id)) return memory.get(id)
-  const disk = readCache(cacheKeys.livePost(id))
+function cacheId(campaignId, id) { return `${campaignId}:${id}` }
+
+function cachedPost(campaignId, id) {
+  const key = cacheId(campaignId, id)
+  if (memory.has(key)) return memory.get(key)
+  const disk = readCache(cacheKeys.livePost(campaignId, id))
   if (disk) {
-    memory.set(id, disk)
+    memory.set(key, disk)
     return disk
   }
   return null
@@ -19,21 +22,22 @@ export function useLivePost() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
-  const fetchLivePost = useCallback(async (id, force = false) => {
+  const fetchLivePost = useCallback(async (campaignId, id, force = false) => {
     if (!force) {
-      const cached = cachedPost(id)
+      const cached = cachedPost(campaignId, id)
       if (cached) return cached
     }
 
-    if (!force && inflight.has(id)) return inflight.get(id)
+    const requestKey = cacheId(campaignId, id)
+    if (!force && inflight.has(requestKey)) return inflight.get(requestKey)
 
     setBusy(true)
     setError('')
-    const request = apiJson(endpoints.livePost(id, force))
+    const request = apiJson(endpoints.livePost(campaignId, id, force))
       .then(data => {
         const post = data.post
-        memory.set(id, post)
-        writeCache(cacheKeys.livePost(id), post)
+        memory.set(requestKey, post)
+        writeCache(cacheKeys.livePost(campaignId, id), post)
         return post
       })
       .catch(err => {
@@ -41,19 +45,20 @@ export function useLivePost() {
         throw err
       })
       .finally(() => {
-        inflight.delete(id)
+        inflight.delete(requestKey)
         setBusy(false)
       })
 
-    inflight.set(id, request)
+    inflight.set(requestKey, request)
     return request
   }, [])
 
   return { fetchLivePost, busy, error }
 }
 
-export function seedLivePost(post) {
+export function seedLivePost(campaignId, post) {
   if (!post?.id) return
-  memory.set(post.id, post)
-  writeCache(cacheKeys.livePost(post.id), post)
+  const key = cacheId(campaignId, post.id)
+  memory.set(key, post)
+  writeCache(cacheKeys.livePost(campaignId, post.id), post)
 }

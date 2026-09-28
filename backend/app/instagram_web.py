@@ -40,7 +40,7 @@ CACHE_DIR = BASE_DIR / "data" / "instagram_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 POST_RE = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/([^/?#]+)/?",
+    r"https?://(?:www\.)?instagram\.com/(p|reel|reels)/([^/?#]+)/?",
     re.IGNORECASE,
 )
 
@@ -79,7 +79,10 @@ def normalize_instagram_url(url: str) -> str:
     match = POST_RE.search(value)
     if not match:
         raise InstagramWebError(f"Invalid Instagram post/reel URL: {value}")
-    return match.group(0).rstrip("/")
+    media_type = match.group(1).lower()
+    shortcode = match.group(2)
+    canonical_type = "p" if media_type == "p" else "reel"
+    return f"https://www.instagram.com/{canonical_type}/{shortcode}"
 
 
 def _is_username(value: str) -> bool:
@@ -504,6 +507,32 @@ class InstagramBrowser:
             for value in payload:
                 self._extract_comments_from_json_sync(value, post_url, output, seen)
 
+    def _extract_embedded_json_comments_sync(
+        self,
+        page: Page,
+        post_url: str,
+        output: list[dict[str, Any]],
+        seen: set[str],
+    ) -> None:
+        """Extract comments from Instagram's embedded application/json blobs."""
+        try:
+            scripts = page.locator('script[type="application/json"]')
+            script_texts = scripts.evaluate_all(
+                "nodes => nodes.map(node => node.textContent || '')"
+            )
+        except Exception:
+            return
+
+        for raw in script_texts:
+            text = str(raw or "")
+            if not any(marker in text for marker in ("comments_connection", "XIGComment", "comment_like_count")):
+                continue
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            self._extract_comments_from_json_sync(payload, post_url, output, seen)
+
     def _click_comment_controls_sync(self, page: Page) -> None:
         patterns = [
             r"view all .*comments?",
@@ -572,7 +601,7 @@ class InstagramBrowser:
                 # complete analysis-source cache. An empty commentsData list
                 # is still a valid cached result for a post with no exposed
                 # comments, so do not use truthiness of the list itself.
-                comments_fetched = bool(cached.get("commentsFetched", False))
+                comments_fetched = bool(cached.get("commentsFetched", False)) and bool(cached.get("commentsData"))
                 age = self._cache_age_seconds_sync(normalized)
                 fresh = age is None or age <= self._cache_ttl
                 cache_is_usable = (not include_comments or comments_fetched)
@@ -649,6 +678,13 @@ class InstagramBrowser:
                 normalized,
             )
 
+            self._extract_embedded_json_comments_sync(
+                page,
+                normalized,
+                comments,
+                {(row["username"].lower(), row["comment"].lower()) for row in comments},
+            )
+
             # Scroll only when comments are requested. Preview/thumbnail calls
             # do not need to hammer the page by loading the full comment list.
             if include_comments:
@@ -661,6 +697,12 @@ class InstagramBrowser:
                     more = self._extract_comments_from_text_sync(
                         updated_body,
                         normalized,
+                    )
+                    self._extract_embedded_json_comments_sync(
+                        page,
+                        normalized,
+                        comments,
+                        {(row["username"].lower(), row["comment"].lower()) for row in comments},
                     )
                     existing = {
                         (row["username"].lower(), row["comment"].lower())
@@ -702,7 +744,7 @@ class InstagramBrowser:
                 "engagement": engagement,
                 "commentsData": comments[:comment_limit],
                 "commentsExtracted": len(comments),
-                "commentsFetched": bool(include_comments),
+                "commentsFetched": bool(include_comments and len(comments) > 0),
                 "source": "instagram_web",
                 "lastSyncedAt": time.time(),
                 "cacheHit": False,

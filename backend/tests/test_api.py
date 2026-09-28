@@ -32,7 +32,7 @@ def test_health():
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert payload["version"] == "5.0.0"
+    assert payload["version"] == "6.0.0"
 
 
 def test_campaign_api_returns_real_workbook_data():

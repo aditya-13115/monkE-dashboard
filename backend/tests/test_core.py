@@ -58,6 +58,7 @@ def test_persistent_json_cache_round_trip(tmp_path):
 def test_instagram_url_normalization():
     assert normalize_instagram_url("https://www.instagram.com/p/ABC123/?utm_source=x") == "https://www.instagram.com/p/ABC123"
     assert normalize_instagram_url("https://www.instagram.com/reel/XYZ/") == "https://www.instagram.com/reel/XYZ"
+    assert normalize_instagram_url("https://www.instagram.com/reels/XYZ/?igsh=abc") == "https://www.instagram.com/reel/XYZ"
 
 
 def test_metric_parser_keeps_like_and_comment_counts_in_order():
@@ -145,3 +146,33 @@ def test_sample_is_bounded_and_never_mutates_input():
     assert len(selected) == 100
     assert has_likes is True
     assert len(source) == 150
+
+
+def test_embedded_instagram_json_comment_extraction():
+    browser = InstagramBrowser()
+    payload = {
+        "comments_connection": {
+            "edges": [
+                {
+                    "node": {
+                        "pk": "1",
+                        "user": {"username": "alice"},
+                        "text": "great reel",
+                        "comment_like_count": 3,
+                        "__typename": "XIGComment",
+                    }
+                }
+            ]
+        }
+    }
+    output = []
+    browser._extract_comments_from_json_sync(
+        payload,
+        "https://www.instagram.com/reel/XYZ",
+        output,
+        set(),
+    )
+    assert len(output) == 1
+    assert output[0]["username"] == "alice"
+    assert output[0]["comment"] == "great reel"
+    assert output[0]["likes"] == 3

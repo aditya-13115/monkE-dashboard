@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "campaigns": [
+    {
+      "id": "asian-paints-main-campaign-3c73e05bef",
+      "brand": "Asian Paints",
+      "campaign": "Main Campaign",
+      "file": "data/campaigns/asian_paints/asian_paints.xlsx",
+      "recordCount": 289,
+      "sourceName": "ASIAN PAINTS (1).xlsx"
+    },
+    {
+      "id": "dhanda-campaign-1-7bc571a1f3",
+      "brand": "dhanda",
+      "campaign": "Campaign 1",
+      "file": "data/campaigns/dhanda/dhanda_campaign_1.xlsx",
+      "recordCount": 5,
+      "sourceName": "dhanda_campaign_1.xlsx"
+    },
+    {
+      "id": "aujla-campaign-1-4692b1198d",
+      "brand": "aujla",
+      "campaign": "Campaign 1",
+      "file": "data/campaigns/aujla/aujla_campaign_1.xlsx",
+      "recordCount": 5,
+      "sourceName": "aujla_campaign_1.xlsx"
+    }
+  ]
+}
