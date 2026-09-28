@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -38,6 +39,8 @@ if not PROFILE_DIR.is_absolute():
 STORAGE_STATE_PATH = PROFILE_DIR / "storage_state.json"
 CACHE_DIR = BASE_DIR / "data" / "instagram_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+COMMENT_EXTRACTION_VERSION = "2026-09-29-2"
 
 POST_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(p|reel|reels)/([^/?#]+)/?",
@@ -447,6 +450,37 @@ class InstagramBrowser:
 
         return comments
 
+    def _extract_metrics_from_json_sync(
+        self,
+        payload: Any,
+        metrics: dict[str, int],
+    ) -> None:
+        """Extract public media counters from Instagram's page/network JSON."""
+        key_map = {
+            "like_count": "likes",
+            "comment_count": "comments",
+            "play_count": "views",
+            "video_view_count": "views",
+            "view_count": "views",
+            "video_play_count": "views",
+            "reshare_count": "shares",
+            "share_count": "shares",
+            "save_count": "saves",
+            "saved_count": "saves",
+        }
+        if isinstance(payload, dict):
+            for key, target in key_map.items():
+                if key in payload:
+                    value = _to_int(payload.get(key))
+                    if value:
+                        metrics[target] = max(metrics.get(target, 0), value)
+            for value in payload.values():
+                self._extract_metrics_from_json_sync(value, metrics)
+        elif isinstance(payload, list):
+            for value in payload:
+                self._extract_metrics_from_json_sync(value, metrics)
+
+
     def _extract_comments_from_json_sync(
         self,
         payload: Any,
@@ -507,6 +541,39 @@ class InstagramBrowser:
             for value in payload:
                 self._extract_comments_from_json_sync(value, post_url, output, seen)
 
+    def _extract_comments_from_html_sync(
+        self,
+        html_text: str,
+        post_url: str,
+        output: list[dict[str, Any]],
+        seen: set[str],
+    ) -> None:
+        """Extract comments from raw HTML application/json script tags.
+
+        Instagram frequently embeds the initial comment connection in a
+        `script[type=application/json]` block. This works for both /p/ posts
+        and /reel/ pages and is less dependent on the current DOM structure.
+        """
+        if not html_text:
+            return
+
+        pattern = re.compile(
+            r"<script\b[^>]*\btype=[\"\']application/json[\"\'][^>]*>(.*?)</script>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(html_text):
+            text = html.unescape(match.group(1) or "").strip()
+            if not text or not any(
+                marker in text
+                for marker in ("comments_connection", "XIGComment", "comment_like_count")
+            ):
+                continue
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            self._extract_comments_from_json_sync(payload, post_url, output, seen)
+
     def _extract_embedded_json_comments_sync(
         self,
         page: Page,
@@ -514,18 +581,29 @@ class InstagramBrowser:
         output: list[dict[str, Any]],
         seen: set[str],
     ) -> None:
-        """Extract comments from Instagram's embedded application/json blobs."""
+        """Extract comments from both raw HTML and DOM script nodes."""
+        try:
+            raw_html = page.content()
+        except Exception:
+            raw_html = ""
+        self._extract_comments_from_html_sync(raw_html, post_url, output, seen)
+
+        # DOM fallback for pages whose script markup is normalized by the
+        # browser in a way that differs from page.content().
         try:
             scripts = page.locator('script[type="application/json"]')
             script_texts = scripts.evaluate_all(
                 "nodes => nodes.map(node => node.textContent || '')"
             )
         except Exception:
-            return
+            script_texts = []
 
         for raw in script_texts:
-            text = str(raw or "")
-            if not any(marker in text for marker in ("comments_connection", "XIGComment", "comment_like_count")):
+            text = str(raw or "").strip()
+            if not text or not any(
+                marker in text
+                for marker in ("comments_connection", "XIGComment", "comment_like_count")
+            ):
                 continue
             try:
                 payload = json.loads(text)
@@ -589,9 +667,6 @@ class InstagramBrowser:
         comment_limit: int,
         force: bool,
     ) -> dict[str, Any]:
-        self._ensure_started_sync()
-        assert self._page is not None
-        page = self._page
         normalized = normalize_instagram_url(post_url)
 
         if not force:
@@ -601,7 +676,10 @@ class InstagramBrowser:
                 # complete analysis-source cache. An empty commentsData list
                 # is still a valid cached result for a post with no exposed
                 # comments, so do not use truthiness of the list itself.
-                comments_fetched = bool(cached.get("commentsFetched", False)) and bool(cached.get("commentsData"))
+                comments_fetched = (
+                    bool(cached.get("commentsFetchAttempted", False))
+                    and cached.get("commentExtractionVersion") == COMMENT_EXTRACTION_VERSION
+                )
                 age = self._cache_age_seconds_sync(normalized)
                 fresh = age is None or age <= self._cache_ttl
                 cache_is_usable = (not include_comments or comments_fetched)
@@ -615,8 +693,16 @@ class InstagramBrowser:
                     cached["cacheHit"] = True
                     return cached
 
+        # Only start Chromium when a network fetch is actually required.
+        # This keeps cache-only page loads working even if the Instagram login
+        # state is unavailable or Chromium is temporarily unavailable.
+        self._ensure_started_sync()
+        assert self._page is not None
+        page = self._page
+
         response_comments: list[dict[str, Any]] = []
         response_seen: set[str] = set()
+        response_metrics = {"likes": 0, "comments": 0, "views": 0, "shares": 0, "saves": 0}
 
         def on_response(response) -> None:
             try:
@@ -626,6 +712,7 @@ class InstagramBrowser:
                 if "json" not in content_type:
                     return
                 payload = response.json()
+                self._extract_metrics_from_json_sync(payload, response_metrics)
                 self._extract_comments_from_json_sync(
                     payload,
                     normalized,
@@ -672,6 +759,25 @@ class InstagramBrowser:
                 body,
                 description,
             )
+
+            # Page-embedded JSON is often the cleanest source for post/reel
+            # counters. Prefer those public counters when present.
+            try:
+                scripts = page.locator('script[type="application/json"]')
+                for raw_script in scripts.evaluate_all("nodes => nodes.map(node => node.textContent || '')"):
+                    text_script = str(raw_script or "").strip()
+                    if not text_script or not any(marker in text_script for marker in ("like_count", "comment_count", "play_count", "video_view_count")):
+                        continue
+                    try:
+                        self._extract_metrics_from_json_sync(json.loads(text_script), metrics)
+                    except (TypeError, ValueError):
+                        continue
+            except Exception:
+                pass
+
+            for key, value in response_metrics.items():
+                if value:
+                    metrics[key] = max(metrics.get(key, 0), value)
 
             comments = self._extract_comments_from_text_sync(
                 body,
@@ -744,7 +850,9 @@ class InstagramBrowser:
                 "engagement": engagement,
                 "commentsData": comments[:comment_limit],
                 "commentsExtracted": len(comments),
-                "commentsFetched": bool(include_comments and len(comments) > 0),
+                "commentsFetched": bool(include_comments),
+                "commentsFetchAttempted": bool(include_comments),
+                "commentExtractionVersion": COMMENT_EXTRACTION_VERSION,
                 "source": "instagram_web",
                 "lastSyncedAt": time.time(),
                 "cacheHit": False,

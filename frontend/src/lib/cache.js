@@ -22,4 +22,5 @@ export const cacheKeys = {
   selectedSentimentPost: campaignId => `selected-sentiment:${campaignId}`,
   sentiment: (campaignId, id) => `sentiment:${campaignId}:${id}`,
   livePost: (campaignId, id) => `live-post:${campaignId}:${id}`,
+  campaignSentiment: campaignId => `campaign-sentiment:${campaignId}`,
 }

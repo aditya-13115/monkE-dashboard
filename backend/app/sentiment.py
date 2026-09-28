@@ -72,8 +72,12 @@ def sample_comments(
     comments: list[dict[str, Any]],
     sample_size: int | None = None,
     seed: int | None = None,
+    *,
+    max_sample_size: int = 100,
+    randomize: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     cleaned: list[dict[str, Any]] = []
+    used_ids: set[int] = set()
     for index, item in enumerate(comments):
         text = str(item.get("comment", "")).strip()
         if not text:
@@ -82,13 +86,33 @@ def sample_comments(
             likes = max(0, int(item.get("likes", 0) or 0))
         except (TypeError, ValueError):
             likes = 0
+
+        try:
+            preserved_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            preserved_id = index + 1
+
+        # Campaign-wide analysis assigns globally unique integer ids before
+        # sending comments to Groq. Preserve those ids so post/reel metadata
+        # can be joined back to the model response for campaign breakdowns.
+        if preserved_id in used_ids:
+            preserved_id = index + 1
+            while preserved_id in used_ids:
+                preserved_id += 1
+        used_ids.add(preserved_id)
+
         cleaned.append(
             {
-                "id": index + 1,
+                "id": preserved_id,
                 "comment": text[:1200],
                 "likes": likes,
                 "post_url": str(item.get("post_url", "") or ""),
                 "username": str(item.get("username", "") or ""),
+                "sourcePostId": item.get("sourcePostId"),
+                "postType": str(item.get("postType", "Post") or "Post"),
+                "creator": str(item.get("creator", "") or ""),
+                "brand": str(item.get("brand", "") or ""),
+                "campaign": str(item.get("campaign", "") or ""),
             }
         )
 
@@ -96,11 +120,14 @@ def sample_comments(
         return [], False
 
     rng = random.Random(seed)
-    target = min(sample_size or SAMPLE_SIZE, len(cleaned), 100)
+    target = min(sample_size or SAMPLE_SIZE, len(cleaned), max(1, int(max_sample_size)))
     has_like_signal = any(row["likes"] > 0 for row in cleaned)
 
     if target <= 0:
         return [], has_like_signal
+
+    if not randomize:
+        return cleaned[:target], has_like_signal
 
     # When per-comment likes exist, bias ~70% toward the higher-liked pool and
     # keep ~30% random to avoid only reading the most popular opinions.
@@ -187,7 +214,11 @@ def _normalize_results(parsed: Any, batch: list[dict[str, Any]]) -> list[dict[st
 
 async def _call_batch(client: AsyncGroq, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
     payload = [
-        {"id": row["id"], "comment": row["comment"], "likes": row["likes"]}
+        {
+            "id": row["id"],
+            "comment": row["comment"],
+            "likes": row["likes"],
+        }
         for row in batch
     ]
 
@@ -265,8 +296,16 @@ async def _call_with_failover(clients: list[AsyncGroq], batch: list[dict[str, An
 async def analyze_comments(
     comments: list[dict[str, Any]],
     sample_size: int | None = None,
+    *,
+    max_sample_size: int = 100,
+    resample: bool = True,
 ) -> dict[str, Any]:
-    selected, has_like_signal = sample_comments(comments, sample_size=sample_size)
+    selected, has_like_signal = sample_comments(
+        comments,
+        sample_size=sample_size,
+        max_sample_size=max_sample_size,
+        randomize=resample,
+    )
     print(
         f"[Sentiment] selected {len(selected)} of {len(comments)} available comments",
         flush=True,
@@ -318,6 +357,12 @@ async def analyze_comments(
             failures.append(str(response))
         else:
             analyses.extend(response)
+
+    expected_ids = {int(row["id"]) for row in selected if isinstance(row.get("id"), (int, str))}
+    returned_ids = {int(row["id"]) for row in analyses if isinstance(row.get("id"), (int, str))}
+    missing_ids = expected_ids - returned_ids
+    if missing_ids:
+        failures.append(f"Groq omitted {len(missing_ids)} comment result(s).")
 
     # Never throw away a complete UI result just because one batch failed.
     # Missing IDs receive an explicit neutral fallback and the error is exposed

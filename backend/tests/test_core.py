@@ -176,3 +176,56 @@ def test_embedded_instagram_json_comment_extraction():
     assert output[0]["username"] == "alice"
     assert output[0]["comment"] == "great reel"
     assert output[0]["likes"] == 3
+
+
+def test_reel_debug_html_embedded_comments_are_extracted():
+    fixture = Path('/mnt/data/work-debug/instagram_debug.html')
+    if not fixture.exists():
+        return
+    browser = InstagramBrowser()
+    output = []
+    browser._extract_comments_from_html_sync(
+        fixture.read_text(encoding='utf-8', errors='ignore'),
+        'https://www.instagram.com/reel/DXHOcduDxID',
+        output,
+        set(),
+    )
+    assert len(output) >= 2
+    assert {row['username'] for row in output} >= {'mamtasuman9649', 'callmevertikaah'}
+
+
+def test_embedded_json_metrics_are_parsed():
+    browser = InstagramBrowser()
+    metrics = {'likes': 0, 'comments': 0, 'views': 0, 'shares': 0, 'saves': 0}
+    browser._extract_metrics_from_json_sync(
+        {
+            'like_count': 1234,
+            'comment_count': 87,
+            'play_count': 98765,
+            'reshare_count': 12,
+            'save_count': 34,
+        },
+        metrics,
+    )
+    assert metrics == {'likes': 1234, 'comments': 87, 'views': 98765, 'shares': 12, 'saves': 34}
+
+
+def test_campaign_sampling_can_keep_all_presampled_comments():
+    from app.sentiment import sample_comments
+    source = [
+        {'comment': f'comment {i}', 'likes': 0, 'username': f'u{i}', 'sourcePostId': i, 'postType': 'Reel'}
+        for i in range(120)
+    ]
+    selected, _ = sample_comments(source, sample_size=80, max_sample_size=500, randomize=False)
+    assert len(selected) == 80
+    assert selected[0]['sourcePostId'] == 0
+
+
+def test_campaign_sample_ids_are_preserved_for_cross_post_aggregation():
+    from app.sentiment import sample_comments
+    source = [
+        {"id": 11, "comment": "one", "likes": 0, "sourcePostId": 1, "postType": "Reel"},
+        {"id": 12, "comment": "two", "likes": 0, "sourcePostId": 2, "postType": "Post"},
+    ]
+    selected, _ = sample_comments(source, sample_size=2, max_sample_size=500, randomize=False)
+    assert [row["id"] for row in selected] == [11, 12]

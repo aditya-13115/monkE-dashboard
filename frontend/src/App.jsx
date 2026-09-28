@@ -85,7 +85,7 @@ function AdminApp() {
     <div className="app-shell">
       <Sidebar active={active} onNavigate={navigate} grouped={catalog.grouped} selectedCampaignId={selectedCampaignId} onSelectCampaign={selectCampaign} />
       <main className="main">
-        <Topbar active={active} campaign={campaign} onRefresh={workspaceOnly ? null : refreshDashboard} refreshing={refreshing} onLogout={auth.logout} showLogout={auth.enabled} />
+        <Topbar active={active} campaign={campaign} campaignId={selectedCampaignId} onRefresh={workspaceOnly ? null : refreshDashboard} refreshing={refreshing} onSynced={refreshDashboard} onLogout={auth.logout} showLogout={auth.enabled} />
         {cached && error && !workspaceOnly && <div className="cache-warning">Showing persisted dashboard cache. Backend refresh failed: {error}</div>}
         {active === 'overview' && campaign && <Overview campaign={campaign} onGo={navigate} />}
         {active === 'posts' && campaign && <Posts campaign={campaign} campaignId={selectedCampaignId} focusedId={focusedId} />}

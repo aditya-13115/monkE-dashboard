@@ -5,6 +5,7 @@ import { seedLivePost } from '../../hooks/useLivePost'
 import { apiJson, endpoints } from '../../lib/api'
 import { cacheKeys, readCache, writeCache } from '../../lib/cache'
 import LivePostCard from './LivePostCard'
+import CampaignSentimentPanel from '../campaignSentiment/CampaignSentimentPanel'
 
 export default function SentimentPage({ campaign, campaignId, setCampaign }) {
   const [query, setQuery] = useState('')
@@ -99,6 +100,8 @@ export default function SentimentPage({ campaign, campaignId, setCampaign }) {
         <div className="selectbox"><select value={type} onChange={event => setType(event.target.value)}><option>All</option><option>Reel</option><option>Post</option></select></div>
         <div className="sentiment-post-count">{visiblePosts.length} posts available</div>
       </div>
+
+      <CampaignSentimentPanel campaignId={campaignId} initialResult={campaign.campaignSentiment} />
 
       <div className="sentiment-post-grid">
         {visiblePosts.map(post => (

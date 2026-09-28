@@ -101,3 +101,70 @@ def test_admin_upload_endpoint_accepts_excel_and_registers_campaign():
     finally:
         with TestClient(app) as client:
             client.delete(f"/api/admin/campaigns/{item['id']}")
+
+
+def test_campaign_sync_endpoint_creates_background_job(monkeypatch):
+    from app import main
+
+    async def fake_sync(job_id, campaign_id, force):
+        return None
+
+    monkeypatch.setattr(main, "_run_campaign_sync_job", fake_sync)
+    with TestClient(app) as client:
+        response = client.post("/api/campaigns/dhanda-campaign-1-7bc571a1f3/sync?force=true")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "sync"
+    assert payload["campaignId"] == "dhanda-campaign-1-7bc571a1f3"
+    main.JOB_STORE.finish_active(payload["jobId"])
+
+
+def test_campaign_sentiment_endpoint_creates_background_job(monkeypatch):
+    from app import main
+
+    async def fake_sentiment_job(job_id, campaign_id, force):
+        return None
+
+    monkeypatch.setattr(main, "_run_campaign_sentiment_job", fake_sentiment_job)
+    with TestClient(app) as client:
+        response = client.post("/api/campaigns/dhanda-campaign-1-7bc571a1f3/sentiment?force=true")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "campaign-sentiment"
+    assert payload["campaignId"] == "dhanda-campaign-1-7bc571a1f3"
+    main.JOB_STORE.finish_active(payload["jobId"])
+
+
+def test_public_share_includes_cached_campaign_sentiment(monkeypatch):
+    from app import main
+
+    campaign_id = "dhanda-campaign-1-7bc571a1f3"
+    main.CAMPAIGN_SENTIMENT_STORE.set(
+        main._campaign_sentiment_key(campaign_id),
+        {
+            "campaignId": campaign_id,
+            "analysis": {
+                "summary": {"positive": 4, "neutral": 1, "negative": 0, "positivePct": 80, "neutralPct": 20, "negativePct": 0},
+                "topics": [{"topic": "brand", "count": 3}],
+                "emotions": [{"emotion": "approval", "count": 3}],
+                "mediaMix": [{"type": "Reel", "count": 2}],
+                "collection": {"attemptedPosts": 5, "postsWithComments": 4, "totalCommentsCollected": 12, "sampledComments": 5, "reels": 3, "reelsWithComments": 2},
+                "postBreakdown": [],
+                "sample": {"selected": 5},
+                "model": "openai/gpt-oss-20b",
+            },
+            "generatedAt": 1,
+        },
+    )
+    share = main.SHARE_STORE.create("dhanda", [campaign_id], "Test")
+    try:
+        with TestClient(app) as client:
+            response = client.get(f"/api/share/{share['token']}")
+        assert response.status_code == 200
+        sentiment = response.json()["campaigns"][0]["campaignSentiment"]
+        assert sentiment["summary"]["positive"] == 4
+        assert sentiment["collection"]["reelsWithComments"] == 2
+        assert "results" not in sentiment
+    finally:
+        main.SHARE_STORE.delete(share["token"])
+        main.CAMPAIGN_SENTIMENT_STORE.delete(main._campaign_sentiment_key(campaign_id))

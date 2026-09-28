@@ -1,10 +1,13 @@
 import { LogOut, RefreshCw } from 'lucide-react'
 import { navItems } from './Sidebar'
+import { useCampaignSync } from '../../hooks/useCampaignJobs'
 
-export default function Topbar({ active, campaign, onRefresh, refreshing, onLogout, showLogout }) {
+export default function Topbar({ active, campaign, campaignId, onRefresh, refreshing, onLogout, showLogout, onSynced }) {
   const label = navItems.find(item => item[0] === active)?.[1] || 'Overview'
   const coverage = Number(campaign?.summary?.livePostsSynced || 0)
   const total = Number(campaign?.summary?.totalPosts || 0)
+  const { job: syncJob, start: startSync, running: syncing } = useCampaignSync(campaignId, onSynced)
+  const syncLabel = syncing ? `Fetching ${syncJob?.processed || 0}/${syncJob?.total || total}` : syncJob?.status === 'complete' ? 'Sync complete' : 'Fetch all Instagram'
   return (
     <header className="topbar">
       <div>
@@ -17,7 +20,11 @@ export default function Topbar({ active, campaign, onRefresh, refreshing, onLogo
           <span className="status-dot" />
           {coverage > 0 ? `Live cache ${coverage}/${total}` : 'Cached campaign data'}
         </div>
-        {onRefresh && <button className="ghost-btn top-refresh" onClick={onRefresh} disabled={refreshing}>
+        {campaignId && <button className="ghost-btn top-refresh" onClick={() => startSync(true)} disabled={syncing}>
+          <RefreshCw size={14} className={syncing ? 'spin' : ''} />
+          {syncLabel}
+        </button>}
+        {onRefresh && <button className="ghost-btn top-refresh" onClick={onRefresh} disabled={refreshing || syncing}>
           <RefreshCw size={14} className={refreshing ? 'spin' : ''} />
           {refreshing ? 'Refreshing…' : 'Refresh dashboard'}
         </button>}

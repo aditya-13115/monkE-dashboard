@@ -12,13 +12,12 @@ export default function Overview({ campaign, onGo }) {
   const liveEngagement = Number(summary.liveEngagement || 0)
   const categoryBar = categories.map((c, index) => ({
     name: c.name,
-    reach: c.reach,
+    liveViews: c.livePosts ? c.liveViews : 0,
     liveEngagement: c.livePosts ? c.liveEngagement : 0,
-    sheetEngagement: c.engagement,
     livePosts: c.livePosts || 0,
     fill: colors[index % colors.length],
   }))
-  const topPosts = [...records].sort((a, b) => b.reach - a.reach).slice(0, 8)
+  const topPosts = [...records].sort((a, b) => (Number(b.liveViews || 0) - Number(a.liveViews || 0)) || (Number(b.reach || 0) - Number(a.reach || 0))).slice(0, 8)
 
   return (
     <div className="page">
@@ -44,23 +43,23 @@ export default function Overview({ campaign, onGo }) {
 
       <div className="grid-two">
         <div className="panel">
-          <SectionHeader eyebrow="Live + recorded performance" title="Reach & public engagement by category" copy="Reach is from the campaign sheet; engagement switches to live public Instagram values for synced placements." />
+          <SectionHeader eyebrow="Live + recorded performance" title="Public views & engagement by category" copy="Once the campaign sync completes, both series come from the live public Instagram cache." />
           {liveCount ? (
             <div className="chart"><ResponsiveContainer width="100%" height={310}>
               <BarChart data={categoryBar} margin={{ top: 10, right: 10, left: 0, bottom: 10 }}>
                 <CartesianGrid strokeDasharray="4 4" vertical={false} />
                 <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fontSize: 11 }} />
                 <YAxis tickFormatter={fmt} tickLine={false} axisLine={false} width={55} />
-                <Tooltip formatter={(value, name) => [fmt(value), name === 'reach' ? 'Reach' : 'Live public engagement']} />
-                <Bar dataKey="reach" name="Reach" radius={[7, 7, 0, 0]} fill="#8b5cf6" />
-                <Bar dataKey="liveEngagement" name="Live public engagement" radius={[7, 7, 0, 0]} fill="#10b981" />
+                <Tooltip formatter={(value, name) => [fmt(value), name === 'liveViews' ? 'Public views' : 'Public engagement']} />
+                <Bar dataKey="liveViews" name="Public views" radius={[7, 7, 0, 0]} fill="#8b5cf6" />
+                <Bar dataKey="liveEngagement" name="Public engagement" radius={[7, 7, 0, 0]} fill="#10b981" />
               </BarChart>
             </ResponsiveContainer></div>
           ) : <EmptyChart text="Open or sync a post to seed persistent live Instagram metrics for the charts." />}
         </div>
 
         <div className="panel">
-          <SectionHeader eyebrow="Top content" title="Posts pulling the most recorded reach" copy="Reach is the workbook metric; use Post Explorer for live public counters on individual posts." />
+          <SectionHeader eyebrow="Top content" title="Posts pulling the most public views" copy="Ranked with live Instagram views after the campaign sync; workbook reach is kept as a separate source-of-truth metric." />
           <div className="rank-list">
             {topPosts.map((p, i) => (
               <button className="rank-row" key={p.id} onClick={() => onGo('posts', p.id)}>
@@ -70,7 +69,7 @@ export default function Overview({ campaign, onGo }) {
                   <strong>@{p.username}</strong>
                   <span>{p.category} • {p.postType}{p.liveDataAvailable ? ' • live synced' : ''}</span>
                 </div>
-                <div className="rank-value">{fmt(p.reach)}<small> reach</small></div>
+                <div className="rank-value">{p.liveDataAvailable ? fmt(p.liveViews) : fmt(p.reach)}<small>{p.liveDataAvailable ? ' views' : ' reach'}</small></div>
               </button>
             ))}
           </div>
@@ -79,10 +78,10 @@ export default function Overview({ campaign, onGo }) {
 
       <div className="grid-three">
         <div className="panel compact">
-          <div className="mini-title">Category share of recorded reach</div>
+          <div className="mini-title">Category share of public views</div>
           <div className="chart small"><ResponsiveContainer width="100%" height={220}>
             <PieChart>
-              <Pie data={categories} dataKey="reach" nameKey="name" innerRadius={56} outerRadius={82} paddingAngle={2}>
+              <Pie data={categories} dataKey="liveViews" nameKey="name" innerRadius={56} outerRadius={82} paddingAngle={2}>
                 {categories.map((_, i) => <Cell key={i} fill={colors[i % colors.length]} />)}
               </Pie>
               <Tooltip formatter={value => fmt(value)} />

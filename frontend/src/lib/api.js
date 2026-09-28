@@ -32,6 +32,11 @@ export const endpoints = {
   deleteShareLink: token => `/api/admin/share-links/${encodeURIComponent(token)}`,
   campaign: id => id ? `/api/campaigns/${encodeURIComponent(id)}` : '/api/campaign',
   livePost: (campaignId, id, force = false) => `/api/campaigns/${encodeURIComponent(campaignId)}/posts/${id}/live${force ? '?force=true' : ''}`,
+  syncCampaign: (campaignId, force = true) => `/api/campaigns/${encodeURIComponent(campaignId)}/sync?force=${force ? 'true' : 'false'}`,
+  syncStatus: (campaignId, jobId) => `/api/campaigns/${encodeURIComponent(campaignId)}/sync/${encodeURIComponent(jobId)}`,
   sentimentPost: (campaignId, id, force = false) => `/api/campaigns/${encodeURIComponent(campaignId)}/sentiment/post/${id}${force ? '?force=true' : ''}`,
+  campaignSentiment: campaignId => `/api/campaigns/${encodeURIComponent(campaignId)}/sentiment`,
+  startCampaignSentiment: (campaignId, force = false) => `/api/campaigns/${encodeURIComponent(campaignId)}/sentiment?force=${force ? 'true' : 'false'}`,
+  campaignSentimentStatus: (campaignId, jobId) => `/api/campaigns/${encodeURIComponent(campaignId)}/sentiment/${encodeURIComponent(jobId)}`,
   publicShare: token => `/api/share/${encodeURIComponent(token)}`,
 }

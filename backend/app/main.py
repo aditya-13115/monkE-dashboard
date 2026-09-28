@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import hashlib
 import os
+import random
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .admin_auth import admin_auth_enabled, require_admin
 from .cache_store import JsonCacheStore
+from .campaign_analysis import aggregate_campaign_sentiment
 from .campaign_manager import CampaignManager, CampaignManagerError
 from .comment_source import InstagramFetchError
 from .data_loader import load_campaign
@@ -27,6 +30,7 @@ from .instagram_web import (
     normalize_instagram_url,
     shutdown_instagram_browser,
 )
+from .job_store import JobStore
 from .sentiment import GroqKeysExhaustedError, MODEL as SENTIMENT_MODEL, analyze_comments
 from .share_store import ShareLinkError, ShareLinkStore
 
@@ -40,7 +44,12 @@ CAMPAIGN_MANAGER = CampaignManager(BASE_DIR)
 SHARE_STORE = ShareLinkStore(DATA_DIR / "share_links.json")
 CAMPAIGN_STORE = JsonCacheStore(CACHE_DIR / "campaign.json")
 SENTIMENT_STORE = JsonCacheStore(CACHE_DIR / "sentiment.json")
+CAMPAIGN_SENTIMENT_STORE = JsonCacheStore(CACHE_DIR / "campaign_sentiment.json")
+JOB_STORE = JobStore()
 SENTIMENT_CACHE_SECONDS = max(300, int(os.getenv("SENTIMENT_CACHE_SECONDS", "86400")))
+CAMPAIGN_SENTIMENT_CACHE_SECONDS = max(300, int(os.getenv("CAMPAIGN_SENTIMENT_CACHE_SECONDS", "86400")))
+CAMPAIGN_COMMENTS_PER_POST = max(1, min(25, int(os.getenv("CAMPAIGN_COMMENTS_PER_POST", "5"))))
+CAMPAIGN_SENTIMENT_MAX_COMMENTS = max(25, min(1000, int(os.getenv("CAMPAIGN_SENTIMENT_MAX_COMMENTS", "500"))))
 DEFAULT_XLSX = BASE_DIR / "data" / "ASIAN PAINTS (1).xlsx"
 LEGACY_XLSX_PATH = Path(os.getenv("CAMPAIGN_XLSX_PATH", str(DEFAULT_XLSX)))
 if not LEGACY_XLSX_PATH.is_absolute():
@@ -254,7 +263,11 @@ def _campaign_with_live_cache(campaign_id: str) -> dict[str, Any]:
 
 
 def get_campaign(campaign_id: str | None = None) -> dict[str, Any]:
-    return _campaign_with_live_cache(campaign_id or _default_campaign_id())
+    resolved = campaign_id or _default_campaign_id()
+    return _attach_campaign_sentiment(
+        _campaign_with_live_cache(resolved),
+        resolved,
+    )
 
 
 def get_post(campaign_id: str, post_id: int) -> dict[str, Any]:
@@ -263,6 +276,71 @@ def get_post(campaign_id: str, post_id: int) -> dict[str, Any]:
         if int(record["id"]) == post_id:
             return record
     raise HTTPException(status_code=404, detail=f"Post {post_id} was not found in campaign {campaign_id}.")
+
+
+def _campaign_signature_for_sentiment(campaign_id: str) -> str:
+    path = CAMPAIGN_MANAGER.resolve_file(campaign_id)
+    signature = _campaign_signature(path)
+    return hashlib.sha256(
+        f"{campaign_id}|{signature}|{SENTIMENT_MODEL}".encode("utf-8")
+    ).hexdigest()
+
+
+def _campaign_sentiment_key(campaign_id: str) -> str:
+    return f"campaign:{_campaign_signature_for_sentiment(campaign_id)}"
+
+
+def _cached_campaign_sentiment(campaign_id: str) -> dict[str, Any] | None:
+    entry = CAMPAIGN_SENTIMENT_STORE.get_entry(_campaign_sentiment_key(campaign_id))
+    if not entry:
+        return None
+    try:
+        age = max(0.0, time.time() - float(entry.get("savedAt", 0)))
+    except (TypeError, ValueError):
+        return None
+    data = entry.get("data")
+    if not isinstance(data, dict):
+        return None
+    payload = copy.deepcopy(data)
+    payload["cached"] = True
+    payload["cacheAgeSeconds"] = round(age, 1)
+    payload["cacheFresh"] = age <= CAMPAIGN_SENTIMENT_CACHE_SECONDS
+    return payload
+
+
+def _save_campaign_sentiment(campaign_id: str, payload: dict[str, Any]) -> None:
+    CAMPAIGN_SENTIMENT_STORE.set(_campaign_sentiment_key(campaign_id), payload)
+
+
+def _public_campaign_sentiment(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not payload:
+        return None
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else payload
+    allowed = {
+        "summary",
+        "topics",
+        "emotions",
+        "mediaMix",
+        "collection",
+        "postBreakdown",
+        "sample",
+        "model",
+        "partial",
+        "errors",
+        "generatedAt",
+        "cached",
+        "cacheAgeSeconds",
+    }
+    return {key: copy.deepcopy(analysis[key]) for key in allowed if key in analysis}
+
+
+def _attach_campaign_sentiment(campaign: dict[str, Any], campaign_id: str) -> dict[str, Any]:
+    payload = _cached_campaign_sentiment(campaign_id)
+    if payload:
+        campaign["campaignSentiment"] = _public_campaign_sentiment(payload)
+    else:
+        campaign.pop("campaignSentiment", None)
+    return campaign
 
 
 def _sentiment_key(post_url: str) -> str:
@@ -469,6 +547,225 @@ async def _post_live(campaign_id: str, post_id: int, force: bool = False) -> dic
     return {"post": combined, "live": live, "cached": bool(live.get("cacheHit", False))}
 
 
+async def _run_campaign_sync_job(job_id: str, campaign_id: str, force: bool) -> None:
+    try:
+        campaign = get_campaign(campaign_id)
+        records = list(campaign.get("records", []))
+        JOB_STORE.start(
+            job_id,
+            total=len(records),
+            phase="instagram",
+            message="Fetching public Instagram metrics and thumbnails…",
+        )
+        synced = 0
+        cached = 0
+        failed = 0
+        errors: list[dict[str, Any]] = []
+
+        for index, post in enumerate(records, start=1):
+            post_url = str(post.get("postLink", "")).strip()
+            if not post_url:
+                failed += 1
+                errors.append({"postId": post.get("id"), "error": "Missing POST LINK"})
+                JOB_STORE.progress(
+                    job_id,
+                    index,
+                    message=f"Skipped post {index}/{len(records)}: missing POST LINK",
+                )
+                continue
+
+            try:
+                live = await fetch_post_preview(post_url, force=force)
+                if live.get("cacheHit"):
+                    cached += 1
+                else:
+                    synced += 1
+                JOB_STORE.progress(
+                    job_id,
+                    index,
+                    message=(
+                        f"Fetched {index}/{len(records)}: @{post.get('username', 'Instagram')} "
+                        f"({post.get('postType', 'Post')})"
+                    ),
+                )
+            except Exception as exc:
+                failed += 1
+                errors.append({"postId": post.get("id"), "postUrl": post_url, "error": str(exc)})
+                JOB_STORE.progress(
+                    job_id,
+                    index,
+                    message=f"Failed {index}/{len(records)}: {exc}",
+                )
+
+        result = {
+            "campaignId": campaign_id,
+            "total": len(records),
+            "fetchedLive": synced,
+            "servedFromCache": cached,
+            "failed": failed,
+            "errors": errors[:20],
+        }
+        JOB_STORE.complete(
+            job_id,
+            result=result,
+            message=(
+                f"Instagram sync complete: {synced} fetched, {cached} cache hits, {failed} failed."
+            ),
+        )
+    except Exception as exc:
+        print(f"[Sync] campaign {campaign_id} failed: {exc}", flush=True)
+        JOB_STORE.fail(job_id, str(exc))
+    finally:
+        JOB_STORE.finish_active(job_id)
+
+
+def _sample_random_comments(
+    comments: list[dict[str, Any]],
+    count: int,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    if not comments:
+        return []
+    if len(comments) <= count:
+        return list(comments)
+    return rng.sample(comments, count)
+
+
+async def _run_campaign_sentiment_job(job_id: str, campaign_id: str, force: bool) -> None:
+    try:
+        campaign = get_campaign(campaign_id)
+        records = list(campaign.get("records", []))
+        JOB_STORE.start(
+            job_id,
+            total=len(records),
+            phase="comments",
+            message="Collecting random public comments from every post and reel…",
+        )
+
+        rng = random.Random()
+        collected: list[dict[str, Any]] = []
+        posts_with_comments = 0
+        reels_total = 0
+        reels_with_comments = 0
+        total_comments_collected = 0
+        errors: list[str] = []
+
+        for index, post in enumerate(records, start=1):
+            post_type = str(post.get("postType", "Post") or "Post")
+            if post_type.lower() == "reel":
+                reels_total += 1
+            post_url = str(post.get("postLink", "")).strip()
+            if not post_url:
+                errors.append(f"Post {post.get('id')} has no POST LINK.")
+                JOB_STORE.progress(job_id, index, message=f"Skipped {index}/{len(records)}: missing POST LINK")
+                continue
+
+            try:
+                source = await fetch_post_analysis_source(
+                    post_url,
+                    comment_limit=min(100, max(CAMPAIGN_COMMENTS_PER_POST * 3, 10)),
+                    force=force,
+                )
+                comments = list(source.get("commentsData", []))
+                total_comments_collected += len(comments)
+                if comments:
+                    posts_with_comments += 1
+                    if post_type.lower() == "reel":
+                        reels_with_comments += 1
+                selected = _sample_random_comments(
+                    comments,
+                    CAMPAIGN_COMMENTS_PER_POST,
+                    rng,
+                )
+                for row in selected:
+                    enriched = dict(row)
+                    # Assign one globally unique numeric id across the whole
+                    # campaign. Groq returns this id and the campaign
+                    # aggregation then joins the sentiment result back to the
+                    # originating post/reel.
+                    enriched["id"] = len(collected) + 1
+                    enriched["sourcePostId"] = post.get("id")
+                    enriched["postType"] = post_type
+                    enriched["creator"] = post.get("username", "")
+                    enriched["brand"] = post.get("brand", campaign.get("meta", {}).get("brand", ""))
+                    enriched["campaign"] = post.get("campaign", campaign.get("meta", {}).get("campaign", ""))
+                    collected.append(enriched)
+                JOB_STORE.progress(
+                    job_id,
+                    index,
+                    message=f"Comments {index}/{len(records)}: {len(comments)} found, {len(selected)} sampled from @{post.get('username', 'Instagram')}",
+                )
+            except Exception as exc:
+                errors.append(f"{post.get('id')}: {exc}")
+                JOB_STORE.progress(
+                    job_id,
+                    index,
+                    message=f"Comments {index}/{len(records)} failed: {exc}",
+                )
+
+        if len(collected) > CAMPAIGN_SENTIMENT_MAX_COMMENTS:
+            collected = rng.sample(collected, CAMPAIGN_SENTIMENT_MAX_COMMENTS)
+
+        JOB_STORE.update(
+            job_id,
+            phase="ai",
+            processed=1,
+            total=2,
+            message=f"Sending {len(collected)} campaign comments to Groq…",
+        )
+
+        analysis = await analyze_comments(
+            collected,
+            sample_size=len(collected),
+            max_sample_size=CAMPAIGN_SENTIMENT_MAX_COMMENTS,
+            resample=False,
+        )
+        analysis["sample"] = {
+            **analysis.get("sample", {}),
+            "strategy": f"Randomly sampled up to {CAMPAIGN_COMMENTS_PER_POST} comments per post/reel, then analyzed as one campaign audience sample.",
+            "perPostLimit": CAMPAIGN_COMMENTS_PER_POST,
+            "maxCampaignComments": CAMPAIGN_SENTIMENT_MAX_COMMENTS,
+        }
+        aggregate = aggregate_campaign_sentiment(
+            analysis,
+            collected,
+            attempted_posts=len(records),
+            posts_with_comments=posts_with_comments,
+            total_comments_collected=total_comments_collected,
+            reel_posts=reels_total,
+            reel_posts_with_comments=reels_with_comments,
+        )
+        payload = {
+            "campaignId": campaign_id,
+            "analysis": {
+                **analysis,
+                **aggregate,
+            },
+            "generatedAt": time.time(),
+            "cached": False,
+            "collectionErrors": errors[:20],
+        }
+        _save_campaign_sentiment(campaign_id, payload)
+        JOB_STORE.complete(
+            job_id,
+            result=_public_campaign_sentiment(payload),
+            message=f"Campaign sentiment complete: {len(collected)} comments analyzed across {len(records)} posts/reels.",
+        )
+        print(
+            f"[Campaign sentiment] complete for {campaign_id}: {len(collected)} comments, "
+            f"{posts_with_comments}/{len(records)} posts with comments",
+            flush=True,
+        )
+    except GroqKeysExhaustedError as exc:
+        print(f"[Campaign sentiment] Groq rate limit for {campaign_id}: {exc}", flush=True)
+        JOB_STORE.fail(job_id, str(exc))
+    except Exception as exc:
+        print(f"[Campaign sentiment] campaign {campaign_id} failed: {exc}", flush=True)
+        JOB_STORE.fail(job_id, str(exc))
+    finally:
+        JOB_STORE.finish_active(job_id)
+
+
 @app.get("/api/posts/{post_id}/live")
 async def legacy_post_live(post_id: int, force: bool = False, _: None = Depends(require_admin)):
     return await _post_live(_default_campaign_id(), post_id, force)
@@ -477,6 +774,83 @@ async def legacy_post_live(post_id: int, force: bool = False, _: None = Depends(
 @app.get("/api/campaigns/{campaign_id}/posts/{post_id}/live")
 async def post_live(campaign_id: str, post_id: int, force: bool = False, _: None = Depends(require_admin)):
     return await _post_live(campaign_id, post_id, force)
+
+
+@app.post("/api/campaigns/{campaign_id}/sync")
+async def sync_campaign(
+    campaign_id: str,
+    force: bool = True,
+    _: None = Depends(require_admin),
+):
+    try:
+        CAMPAIGN_MANAGER.get(campaign_id)
+    except CampaignManagerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    active = JOB_STORE.active(campaign_id, "sync")
+    if active:
+        return active
+    job = JOB_STORE.create(campaign_id, "sync")
+    asyncio.create_task(_run_campaign_sync_job(job["jobId"], campaign_id, force))
+    return job
+
+
+@app.get("/api/campaigns/{campaign_id}/sync/{job_id}")
+def sync_campaign_status(campaign_id: str, job_id: str, _: None = Depends(require_admin)):
+    job = JOB_STORE.get(job_id)
+    if not job or str(job.get("campaignId")) != campaign_id or job.get("kind") != "sync":
+        raise HTTPException(status_code=404, detail="Sync job was not found.")
+    return job
+
+
+@app.post("/api/campaigns/{campaign_id}/sentiment")
+async def start_campaign_sentiment(
+    campaign_id: str,
+    force: bool = False,
+    _: None = Depends(require_admin),
+):
+    try:
+        CAMPAIGN_MANAGER.get(campaign_id)
+    except CampaignManagerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if not force:
+        cached = _cached_campaign_sentiment(campaign_id)
+        if cached:
+            return {
+                "status": "complete",
+                "cached": True,
+                "result": _public_campaign_sentiment(cached),
+            }
+
+    active = JOB_STORE.active(campaign_id, "campaign-sentiment")
+    if active:
+        return active
+    job = JOB_STORE.create(campaign_id, "campaign-sentiment")
+    asyncio.create_task(_run_campaign_sentiment_job(job["jobId"], campaign_id, force))
+    return job
+
+
+@app.get("/api/campaigns/{campaign_id}/sentiment/{job_id}")
+def campaign_sentiment_status(campaign_id: str, job_id: str, _: None = Depends(require_admin)):
+    job = JOB_STORE.get(job_id)
+    if not job or str(job.get("campaignId")) != campaign_id or job.get("kind") != "campaign-sentiment":
+        raise HTTPException(status_code=404, detail="Campaign sentiment job was not found.")
+    return job
+
+
+@app.get("/api/campaigns/{campaign_id}/sentiment")
+def campaign_sentiment_data(campaign_id: str, _: None = Depends(require_admin)):
+    try:
+        CAMPAIGN_MANAGER.get(campaign_id)
+    except CampaignManagerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    cached = _cached_campaign_sentiment(campaign_id)
+    return {
+        "available": bool(cached),
+        "cached": bool(cached),
+        "result": _public_campaign_sentiment(cached) if cached else None,
+    }
 
 
 async def _sentiment_for_post(campaign_id: str, post_id: int, force: bool = False) -> dict[str, Any]:

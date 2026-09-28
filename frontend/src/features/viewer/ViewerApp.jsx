@@ -4,6 +4,7 @@ import { Bar, BarChart, CartesianGrid, Pie, PieChart, ResponsiveContainer, Toolt
 import { Metric, Pill, PostThumbnail } from '../../components/common/UI'
 import { apiJson, endpoints } from '../../lib/api'
 import { fmt, pct } from '../../lib/metrics'
+import CampaignSentimentPanel from '../campaignSentiment/CampaignSentimentPanel'
 
 const palette = ['#8b5cf6', '#10b981', '#3b82f6', '#f59e0b', '#f43f5e', '#14b8a6']
 
@@ -54,8 +55,8 @@ export default function ViewerApp() {
   const campaigns = data.campaigns || []
   const active = selectedCampaign || campaigns[0]
   const summary = aggregate([active])
-  const categories = (active.categories || []).map((row, index) => ({ ...row, fill: palette[index % palette.length] }))
-  const topPosts = [...(active.records || [])].sort((a, b) => Number(b.reach || 0) - Number(a.reach || 0)).slice(0, 8)
+  const categories = (active.categories || []).map((row, index) => ({ ...row, liveViews: Number(row.liveViews || 0), liveEngagement: Number(row.liveEngagement || 0), fill: palette[index % palette.length] }))
+  const topPosts = [...(active.records || [])].sort((a, b) => Number(b.liveViews || 0) - Number(a.liveViews || 0)).slice(0, 8)
 
   return (
     <div className="viewer-shell">
@@ -77,12 +78,14 @@ export default function ViewerApp() {
           <Metric icon={BarChart3} label="Live views" value={fmt(summary.liveViews)} sub="Persisted public metric" accent="orange" />
         </div>
 
+        <CampaignSentimentPanel campaignId={active.records?.[0]?.campaignId} initialResult={active.campaignSentiment} readonly />
+
         <div className="grid-two">
-          <div className="panel"><div className="eyebrow">Distribution</div><h2>Reach by content category</h2><div className="chart"><ResponsiveContainer width="100%" height={300}><BarChart data={categories}><CartesianGrid strokeDasharray="4 4" vertical={false} /><XAxis dataKey="name" tickLine={false} axisLine={false} /><YAxis tickFormatter={fmt} tickLine={false} axisLine={false} /><Tooltip formatter={(value) => fmt(value)} /><Bar dataKey="reach" radius={[8,8,0,0]} fill="#8b5cf6" /></BarChart></ResponsiveContainer></div></div>
-          <div className="panel"><div className="eyebrow">Mix</div><h2>Content share</h2><div className="chart"><ResponsiveContainer width="100%" height={300}><PieChart><Pie data={categories} dataKey="reach" nameKey="name" innerRadius={65} outerRadius={100} paddingAngle={3}>{categories.map((item, i) => <Cell key={item.name} fill={palette[i % palette.length]} />)}</Pie><Tooltip formatter={(value) => fmt(value)} /></PieChart></ResponsiveContainer></div><div className="viewer-legend">{categories.map((item, i) => <span key={item.name}><i style={{ background: palette[i % palette.length] }} />{item.name}</span>)}</div></div>
+          <div className="panel"><div className="eyebrow">Distribution</div><h2>Reach by content category</h2><div className="chart"><ResponsiveContainer width="100%" height={300}><BarChart data={categories}><CartesianGrid strokeDasharray="4 4" vertical={false} /><XAxis dataKey="name" tickLine={false} axisLine={false} /><YAxis tickFormatter={fmt} tickLine={false} axisLine={false} /><Tooltip formatter={(value) => fmt(value)} /><Bar dataKey="liveViews" name="Public views" radius={[8,8,0,0]} fill="#8b5cf6" /></BarChart></ResponsiveContainer></div></div>
+          <div className="panel"><div className="eyebrow">Mix</div><h2>Content share</h2><div className="chart"><ResponsiveContainer width="100%" height={300}><PieChart><Pie data={categories} dataKey="liveViews" nameKey="name" innerRadius={65} outerRadius={100} paddingAngle={3}>{categories.map((item, i) => <Cell key={item.name} fill={palette[i % palette.length]} />)}</Pie><Tooltip formatter={(value) => fmt(value)} /></PieChart></ResponsiveContainer></div><div className="viewer-legend">{categories.map((item, i) => <span key={item.name}><i style={{ background: palette[i % palette.length] }} />{item.name}</span>)}</div></div>
         </div>
 
-        <div className="panel"><div className="eyebrow">Top content</div><h2>Highest recorded-reach posts</h2><div className="viewer-post-grid">{topPosts.map(post => <article className="viewer-post-card" key={post.id}><PostThumbnail post={post} /><div><strong>@{post.username}</strong><span>{fmt(post.reach)} reach • {fmt(post.liveEngagement || post.engagement)} engagement</span></div></article>)}</div></div>
+        <div className="panel"><div className="eyebrow">Top content</div><h2>Highest public-view posts</h2><div className="viewer-post-grid">{topPosts.map(post => <article className="viewer-post-card" key={post.id}><PostThumbnail post={post} /><div><strong>@{post.username}</strong><span>{fmt(post.liveViews)} public views • {fmt(post.liveEngagement || post.engagement)} engagement</span></div></article>)}</div></div>
         <div className="viewer-footer">Read-only shared view • {data.brand} • {campaigns.length} campaign{campaigns.length === 1 ? '' : 's'} available</div>
       </main>
     </div>
